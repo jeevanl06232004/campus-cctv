@@ -14,9 +14,16 @@
     "cooldown_seconds": 25,
     "sensitivity": "medium",
     "sound_alarm": true,
+    "smtp": {
+        "enabled": false,
+        "host": "smtp.gmail.com",
+        "port": 587,
+        "sender_email": "",
+        "sender_password": ""
+    },
     "telegram": {
         "enabled": true,
         "bot_token": "9257038893:AAGeMBwqGoCOvt9rtZE2PLee2p6UEIs_LOs",
-        "chat_id": ""
+        "chat_id": "5263576775"
     }
 }
