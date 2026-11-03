@@ -1,0 +1,17 @@
+{
+    "master_password": "admin",
+    "authorities_count": 1,
+    "on_duty_id": 1,
+    "authorities": [
+        {
+            "id": 1,
+            "name": "Jeevan",
+            "phone": "9353415499",
+            "email": "jeevanl06232003@gmail.com",
+            "is_on_duty": true
+        }
+    ],
+    "cooldown_seconds": 25,
+    "sensitivity": "medium",
+    "sound_alarm": true
+}
