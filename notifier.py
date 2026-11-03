@@ -40,6 +40,11 @@ DEFAULT_CONFIG = {
         "port": 587,
         "sender_email": "",
         "sender_password": ""
+    },
+    "telegram": {
+        "enabled": True,
+        "bot_token": "9257038893:AAGeMBwqGoCOvt9rtZE2PLee2p6UEIs_LOs",
+        "chat_id": ""
     }
 }
 
@@ -453,6 +458,147 @@ class AlertManager:
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
+    def _send_telegram_alert_async(self, message_text, snapshot_path=None):
+        def _worker():
+            try:
+                tg_cfg = self.config.get("telegram", {})
+                if not tg_cfg.get("enabled", True):
+                    return
+                bot_token = tg_cfg.get("bot_token", "").strip()
+                chat_id = str(tg_cfg.get("chat_id", "")).strip()
+                if not bot_token or not chat_id:
+                    print("[Notifier] Telegram skipped: bot_token or chat_id not configured")
+                    return
+
+                html_msg = (
+                    f"🚨 <b>CAMPUS CCTV SECURITY ALERT</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{message_text}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<i>Immediate security review requested.</i>"
+                )
+
+                sent_photo = False
+                if snapshot_path and Path(snapshot_path).exists():
+                    try:
+                        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+                        caption = html_msg[:1024]
+                        with open(snapshot_path, "rb") as photo_file:
+                            files = {"photo": photo_file}
+                            data = {
+                                "chat_id": chat_id,
+                                "caption": caption,
+                                "parse_mode": "HTML"
+                            }
+                            resp = requests.post(url, data=data, files=files, timeout=12)
+                            res_json = resp.json()
+                            if res_json.get("ok"):
+                                print(f"[Notifier] ✅ Telegram photo alert delivered to chat {chat_id}")
+                                sent_photo = True
+                            else:
+                                print(f"[Notifier] Telegram photo error: {res_json.get('description')}")
+                    except Exception as p_err:
+                        print(f"[Notifier] Telegram photo dispatch error: {p_err}")
+
+                if not sent_photo:
+                    try:
+                        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                        payload = {
+                            "chat_id": chat_id,
+                            "text": html_msg[:4096],
+                            "parse_mode": "HTML"
+                        }
+                        resp = requests.post(url, json=payload, timeout=8)
+                        res_json = resp.json()
+                        if res_json.get("ok"):
+                            print(f"[Notifier] ✅ Telegram text alert delivered to chat {chat_id}")
+                        else:
+                            print(f"[Notifier] Telegram message error: {res_json.get('description')}")
+                    except Exception as m_err:
+                        print(f"[Notifier] Telegram message dispatch error: {m_err}")
+
+            except Exception as e:
+                print(f"[Notifier] Telegram worker exception: {e}")
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+    def auto_detect_telegram_chat_id(self):
+        """
+        Polls Telegram getUpdates API to find the chat_id of the user
+        who clicked /start or sent a message to the bot.
+        """
+        tg_cfg = self.config.get("telegram", {})
+        bot_token = tg_cfg.get("bot_token", "").strip()
+        if not bot_token:
+            return False, "Bot token is not configured in settings."
+
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+            resp = requests.get(url, timeout=8)
+            data = resp.json()
+            if not data.get("ok"):
+                return False, f"Telegram API error: {data.get('description', 'Unknown error')}"
+
+            results = data.get("result", [])
+            if not results:
+                return False, "No messages found yet. Please open Telegram, search for your bot, and press 'Start' or send a message!"
+
+            last_update = results[-1]
+            msg = last_update.get("message") or last_update.get("channel_post") or last_update.get("my_chat_member")
+            if not msg:
+                return False, "Could not extract chat info from the latest update."
+
+            chat = msg.get("chat", {})
+            chat_id = str(chat.get("id"))
+            chat_title = chat.get("first_name") or chat.get("title") or chat.get("username") or "User"
+
+            if not chat_id:
+                return False, "Chat ID was not found in the update."
+
+            with self.lock:
+                if "telegram" not in self.config:
+                    self.config["telegram"] = {}
+                self.config["telegram"]["chat_id"] = chat_id
+                self.config["telegram"]["enabled"] = True
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(self.config, f, indent=4)
+
+            return True, f"Detected and connected to '{chat_title}' (Chat ID: {chat_id})!"
+        except Exception as e:
+            return False, f"Network error communicating with Telegram: {e}"
+
+    def test_telegram_alert(self):
+        """Sends a verification test alert to Telegram."""
+        tg_cfg = self.config.get("telegram", {})
+        bot_token = tg_cfg.get("bot_token", "").strip()
+        chat_id = str(tg_cfg.get("chat_id", "")).strip()
+        if not bot_token or not chat_id:
+            return False, "Bot token or Chat ID is missing. Please configure them first."
+
+        test_msg = (
+            "✅ <b>TELEGRAM ALERT SYSTEM ONLINE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Campus CCTV Security notifications are properly configured.\n"
+            "You will receive immediate photo alerts here whenever a fight or violent anomaly is detected on campus cameras."
+        )
+
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": test_msg,
+                "parse_mode": "HTML"
+            }
+            resp = requests.post(url, json=payload, timeout=8)
+            res = resp.json()
+            if res.get("ok"):
+                return True, "Test message delivered to your Telegram!"
+            else:
+                return False, f"Telegram API error: {res.get('description')}"
+        except Exception as e:
+            return False, f"Error sending test message: {e}"
+
     def trigger_alert(self, alert_type, details, frame=None, force=False):
         now = time.time()
         cooldown = self.config.get("cooldown_seconds", 25)
@@ -540,6 +686,19 @@ class AlertManager:
             print(f"[Notifier] Dispatched push notification to {push_url}")
         except Exception as push_err:
             print(f"[Notifier] Push dispatch notice: {push_err}")
+
+        # Real Telegram Photo Alert (Fast, Instant, Free)
+        self._send_telegram_alert_async(
+            message_text=(
+                f"<b>Status:</b> {alert_title}\n"
+                f"<b>Camera Location:</b> {details.get('location', 'Camera 01 - Main Quad')}\n"
+                f"<b>Action Time:</b> {timestamp_str}\n"
+                f"<b>On-Duty Authority:</b> {auth_name}\n"
+                f"<b>Confidence:</b> {details.get('score', 0):.1f}%\n"
+                f"<b>Targets:</b> {persons_str}"
+            ),
+            snapshot_path=str(snapshot_path) if snapshot_filename else None
+        )
 
         # Real SMS dispatch
         if clean_phone:

@@ -13,5 +13,10 @@
     ],
     "cooldown_seconds": 25,
     "sensitivity": "medium",
-    "sound_alarm": true
+    "sound_alarm": true,
+    "telegram": {
+        "enabled": true,
+        "bot_token": "9257038893:AAGeMBwqGoCOvt9rtZE2PLee2p6UEIs_LOs",
+        "chat_id": ""
+    }
 }

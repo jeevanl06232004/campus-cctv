@@ -1599,6 +1599,48 @@ header {
                     </a>
                 </div>
             </div>
+
+            <!-- Telegram Bot Instant Alert Card -->
+            <div class="card" style="background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(15, 23, 42, 0.85)); border: 1px solid rgba(59, 130, 246, 0.4); margin-top: 14px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <div style="font-size: 13px; font-weight: 700; color: #60a5fa; display: flex; align-items: center; gap: 6px;">
+                        <span>✈️</span> Telegram Phone Alert Hub
+                    </div>
+                    <span id="tgStatusBadge" class="duty-badge-active" style="background: #2563eb;">CHECKING...</span>
+                </div>
+                <p style="font-size: 11px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
+                    Receive <b style="color: #93c5fd;">instant CCTV photo snapshots</b> of fights and critical incidents directly on your phone via Telegram (100% Free &amp; Unlimited).
+                </p>
+
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: var(--radius-sm); border: 1px solid rgba(255,255,255,0.06); margin-bottom: 10px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 6px;">
+                        <span style="color: var(--text-muted);">Bot Account:</span>
+                        <a href="https://t.me/Alert_22bms_bot" target="_blank" style="color: #38bdf8; font-weight: 700; text-decoration: underline;">
+                            @Alert_22bms_bot ↗
+                        </a>
+                    </div>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                        <input type="text" id="tgChatId" placeholder="Your Telegram Chat ID" class="input-text" style="flex: 1; padding: 6px 10px; font-size: 11px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); color: #fff; border-radius: 4px;">
+                        <button class="btn btn-secondary" onclick="saveTelegramSettings()" style="padding: 6px 12px; font-size: 11px;">
+                            Save
+                        </button>
+                    </div>
+                    <div id="tgDetectStatus" style="font-size: 10px; margin-top: 6px;"></div>
+                </div>
+
+                <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                    <a href="https://t.me/Alert_22bms_bot" target="_blank" class="btn" style="flex: 1; min-width: 130px; background: #2563eb; font-size: 11px; font-weight: 700; text-align: center; text-decoration: none; padding: 7px 10px; color: #fff; border-radius: 4px;">
+                        1️⃣ Open Bot &amp; Start
+                    </a>
+                    <button class="btn btn-secondary" onclick="autoDetectTelegramChatId()" style="flex: 1; min-width: 140px; font-size: 11px; font-weight: 700; padding: 7px 10px;">
+                        2️⃣ Auto-Detect Chat ID
+                    </button>
+                    <button class="btn btn-danger" onclick="sendTestTelegramAlert()" style="flex: 1; min-width: 130px; font-size: 11px; font-weight: 700; padding: 7px 10px; background: linear-gradient(135deg, #10b981, #059669);">
+                        ⚡ Send Test to Phone
+                    </button>
+                </div>
+            </div>
+
         </div>
 
         <!-- Threat Diagnostics Card -->
@@ -2442,8 +2484,88 @@ document.addEventListener('click', () => {
     if (audioContext && audioContext.state === 'suspended') audioContext.resume();
 }, {once: false});
 
+
+async function loadTelegramStatus() {
+    try {
+        const res = await fetch('/api/telegram/status');
+        const data = await res.json();
+        const input = document.getElementById('tgChatId');
+        const badge = document.getElementById('tgStatusBadge');
+        if (input && data.chat_id) {
+            input.value = data.chat_id;
+        }
+        if (badge) {
+            if (data.has_chat_id) {
+                badge.className = 'duty-badge-active';
+                badge.innerText = 'CONNECTED';
+                badge.style.background = '#059669';
+            } else {
+                badge.className = 'badge-red';
+                badge.innerText = 'UNPAIRED';
+                badge.style.display = 'inline-block';
+            }
+        }
+    } catch (e) {
+        console.warn("Failed to load Telegram status:", e);
+    }
+}
+
+async function autoDetectTelegramChatId() {
+    const statusDiv = document.getElementById('tgDetectStatus');
+    if (statusDiv) statusDiv.innerHTML = '<span style="color: #38bdf8;">🔄 Checking Telegram bot updates...</span>';
+    try {
+        const res = await fetch('/api/telegram/detect_chat_id', {method: 'POST'});
+        const data = await res.json();
+        if (data.ok) {
+            if (statusDiv) statusDiv.innerHTML = `<span style="color: #34d399;">✅ ${data.message}</span>`;
+            if (data.chat_id) {
+                document.getElementById('tgChatId').value = data.chat_id;
+            }
+            loadTelegramStatus();
+        } else {
+            if (statusDiv) statusDiv.innerHTML = `<span style="color: #f87171;">⚠️ ${data.message}</span>`;
+        }
+    } catch (e) {
+        if (statusDiv) statusDiv.innerHTML = `<span style="color: #f87171;">❌ Error: ${e}</span>`;
+    }
+}
+
+async function saveTelegramSettings() {
+    const chatId = document.getElementById('tgChatId').value.trim();
+    const statusDiv = document.getElementById('tgDetectStatus');
+    try {
+        const res = await fetch('/api/telegram/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({chat_id: chatId, enabled: true})
+        });
+        const data = await res.json();
+        if (statusDiv) statusDiv.innerHTML = `<span style="color: #34d399;">💾 ${data.message}</span>`;
+        loadTelegramStatus();
+    } catch (e) {
+        if (statusDiv) statusDiv.innerHTML = `<span style="color: #f87171;">❌ Error saving: ${e}</span>`;
+    }
+}
+
+async function sendTestTelegramAlert() {
+    const statusDiv = document.getElementById('tgDetectStatus');
+    if (statusDiv) statusDiv.innerHTML = '<span style="color: #38bdf8;">📤 Sending test alert to Telegram...</span>';
+    try {
+        const res = await fetch('/api/telegram/test', {method: 'POST'});
+        const data = await res.json();
+        if (data.ok) {
+            if (statusDiv) statusDiv.innerHTML = `<span style="color: #34d399;">✅ Check your phone! Test alert delivered to Telegram!</span>`;
+        } else {
+            if (statusDiv) statusDiv.innerHTML = `<span style="color: #f87171;">⚠️ ${data.message}</span>`;
+        }
+    } catch (e) {
+        if (statusDiv) statusDiv.innerHTML = `<span style="color: #f87171;">❌ Network error: ${e}</span>`;
+    }
+}
+
 // Initial Boot
 loadAuthorityDirectory();
+loadTelegramStatus();
 loadVideos();
 loadIncidents();
 refreshAuthorityMessage();
@@ -2657,6 +2779,54 @@ def silence_alarm_api():
 @app.route("/api/alarm/status", methods=["GET"])
 def alarm_status_api():
     return jsonify(alert_manager.get_alarm_status())
+
+
+
+@app.route("/api/telegram/status", methods=["GET"])
+def telegram_status_api():
+    cfg = alert_manager.config.get("telegram", {})
+    return jsonify({
+        "enabled": cfg.get("enabled", True),
+        "bot_token": cfg.get("bot_token", ""),
+        "chat_id": cfg.get("chat_id", ""),
+        "bot_username": "Alert_22bms_bot",
+        "has_chat_id": bool(cfg.get("chat_id", ""))
+    })
+
+
+@app.route("/api/telegram/save", methods=["POST"])
+def telegram_save_api():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled", True))
+    bot_token = data.get("bot_token", "").strip()
+    chat_id = str(data.get("chat_id", "")).strip()
+
+    with alert_manager.lock:
+        if "telegram" not in alert_manager.config:
+            alert_manager.config["telegram"] = {}
+        alert_manager.config["telegram"]["enabled"] = enabled
+        if bot_token:
+            alert_manager.config["telegram"]["bot_token"] = bot_token
+        if chat_id:
+            alert_manager.config["telegram"]["chat_id"] = chat_id
+        alert_manager.save_config()
+    return jsonify(ok=True, message="Telegram settings saved successfully.")
+
+
+@app.route("/api/telegram/detect_chat_id", methods=["POST"])
+def telegram_detect_chat_id_api():
+    ok, msg = alert_manager.auto_detect_telegram_chat_id()
+    return jsonify(
+        ok=ok,
+        message=msg,
+        chat_id=alert_manager.config.get("telegram", {}).get("chat_id", "")
+    )
+
+
+@app.route("/api/telegram/test", methods=["POST"])
+def telegram_test_api():
+    ok, msg = alert_manager.test_telegram_alert()
+    return jsonify(ok=ok, message=msg)
 
 
 @app.route("/api/test_alert", methods=["POST"])
