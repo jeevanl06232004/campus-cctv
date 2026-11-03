@@ -484,38 +484,38 @@ class AlertManager:
                         url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
                         caption = html_msg[:1024]
                         with open(snapshot_path, "rb") as photo_file:
-                            files = {"photo": photo_file}
+                            files = {"photo": ("snapshot.jpg", photo_file, "image/jpeg")}
                             data = {
-                                "chat_id": chat_id,
-                                "caption": caption,
+                                "chat_id": str(chat_id),
+                                "caption": caption.encode("utf-8"),
                                 "parse_mode": "HTML"
                             }
                             resp = requests.post(url, data=data, files=files, timeout=12)
                             res_json = resp.json()
                             if res_json.get("ok"):
-                                print(f"[Notifier] ✅ Telegram photo alert delivered to chat {chat_id}")
+                                print(f"[Notifier] [OK] Telegram photo alert delivered to chat {chat_id}")
                                 sent_photo = True
                             else:
-                                print(f"[Notifier] Telegram photo error: {res_json.get('description')}")
+                                print(f"[Notifier] Telegram photo notice: {res_json.get('description')}")
                     except Exception as p_err:
-                        print(f"[Notifier] Telegram photo dispatch error: {p_err}")
+                        print(f"[Notifier] Telegram photo dispatch notice: {p_err}")
 
                 if not sent_photo:
                     try:
                         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
                         payload = {
-                            "chat_id": chat_id,
+                            "chat_id": str(chat_id),
                             "text": html_msg[:4096],
                             "parse_mode": "HTML"
                         }
                         resp = requests.post(url, json=payload, timeout=8)
                         res_json = resp.json()
                         if res_json.get("ok"):
-                            print(f"[Notifier] ✅ Telegram text alert delivered to chat {chat_id}")
+                            print(f"[Notifier] [OK] Telegram text alert delivered to chat {chat_id}")
                         else:
-                            print(f"[Notifier] Telegram message error: {res_json.get('description')}")
+                            print(f"[Notifier] Telegram message notice: {res_json.get('description')}")
                     except Exception as m_err:
-                        print(f"[Notifier] Telegram message dispatch error: {m_err}")
+                        print(f"[Notifier] Telegram message dispatch notice: {m_err}")
 
             except Exception as e:
                 print(f"[Notifier] Telegram worker exception: {e}")
