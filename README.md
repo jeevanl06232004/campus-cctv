@@ -65,3 +65,4 @@ python train_fight_model.py --use-videos
 * **Computer Vision:** OpenCV, NumPy
 * **Backend:** Python Flask
 * **Frontend:** HTML5, CSS3, JavaScript, WebAudio API
+
