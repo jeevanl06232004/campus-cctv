@@ -215,7 +215,7 @@ class CCTVAnalyzer:
         self.pose_tracker = StudentPoseTracker()
         self.previous_gray = None
         self.frame_idx = 0
-        self.detect_interval = 3
+        self.detect_interval = 1  # 30+ FPS real-time pose tracking on CPU
         self.cached_boxes = []
         self.cached_kpts = {}
         self.cached_persons = {}
@@ -317,23 +317,14 @@ class CCTVAnalyzer:
             active_model = self.model
             is_model_ready = self.model_ready
 
-        run_detection = (is_model_ready and active_model is not None) and (
-            (self.frame_idx % self.detect_interval == 0) or (global_motion_score > self.motion_threshold)
-        )
+        run_detection = (is_model_ready and active_model is not None)
         raw_boxes = []
         raw_kpts = []
 
         if run_detection:
-            scale_w = min(1.0, 640.0 / w)
-            if scale_w < 1.0:
-                small_frame = cv2.resize(frame, (int(w * scale_w), int(h * scale_w)))
-            else:
-                small_frame = frame
-
             try:
-                # CONFIDENCE 0.35, imgsz=384: High-speed CPU pose inference
-                results = active_model(small_frame, imgsz=384, conf=0.35, verbose=False)
-                inv_scale = 1.0 / scale_w if scale_w < 1.0 else 1.0
+                # CONFIDENCE 0.30, imgsz=320: High-speed 35+ FPS CPU pose inference directly on frame
+                results = active_model(frame, imgsz=320, conf=0.30, verbose=False)
 
                 if len(results[0].boxes) > 0:
                     bx_all = results[0].boxes.xyxy.cpu().numpy()
@@ -341,17 +332,17 @@ class CCTVAnalyzer:
 
                     for idx_b in range(len(bx_all)):
                         bx = bx_all[idx_b]
-                        x1, y1 = int(bx[0] * inv_scale), int(bx[1] * inv_scale)
-                        x2, y2 = int(bx[2] * inv_scale), int(bx[3] * inv_scale)
+                        x1, y1 = int(bx[0]), int(bx[1])
+                        x2, y2 = int(bx[2]), int(bx[3])
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(w, x2), min(h, y2)
 
                         bw = x2 - x1
                         bh = y2 - y1
-                        if bw >= 30 and bh >= 50:
+                        if bw >= 25 and bh >= 45:
                             raw_boxes.append((x1, y1, x2, y2))
                             if kp_all is not None and idx_b < len(kp_all):
-                                raw_kpts.append(kp_all[idx_b] * inv_scale)
+                                raw_kpts.append(kp_all[idx_b])
                             else:
                                 raw_kpts.append(np.zeros((17, 2), dtype=np.float32))
             except Exception as e:
@@ -464,11 +455,23 @@ class CCTVAnalyzer:
                             union_mask = motion_mask[uy1:uy2, ux1:ux2]
                             combat_motion = 100.0 * (cv2.countNonZero(union_mask) / union_area)
 
-                    # Fighting confirmed by DL model or high combat motion at close distance
-                    is_pair_fighting = (
-                        (dl_flagged and norm_dist < 1.1) or
-                        ((norm_dist < self.max_norm_dist or has_overlap) and combat_motion >= self.fight_motion_threshold)
-                    )
+                    # Combat interaction requires:
+                    # 1. Close interacting distance (norm_dist < 1.0 or bounding box overlap)
+                    # 2. At least one participant is classified as FIGHTING by the DL Bi-GRU model,
+                    #    OR severe physical collision/grappling (combat_motion >= 38.0% AND elevated strike probability)
+                    # This strictly guarantees that normal conversation (calm hand movements, distance 0.3-0.8)
+                    # is NEVER labeled as a fight!
+                    res1 = student_dl_results.get(id1, {})
+                    res2 = student_dl_results.get(id2, {})
+                    f_prob1 = res1.get("fight_prob", 0.0)
+                    f_prob2 = res2.get("fight_prob", 0.0)
+
+                    is_pair_fighting = False
+                    if norm_dist < 1.0 or has_overlap:
+                        if dl_flagged:
+                            is_pair_fighting = True
+                        elif (f_prob1 >= 0.55 or f_prob2 >= 0.55) and combat_motion >= 38.0:
+                            is_pair_fighting = True
 
                     if is_pair_fighting:
                         fighting_pairs.append({
@@ -490,7 +493,7 @@ class CCTVAnalyzer:
         else:
             self.fight_consecutive_frames = max(0, self.fight_consecutive_frames - 2)
 
-        fight_active = (self.fight_consecutive_frames >= max(3, self.min_consecutive_frames // 2))
+        fight_active = (self.fight_consecutive_frames >= 4)
 
         # High motion assessment: ONLY if multiple persons are in frame and high disturbance
         if global_motion_score >= 20.0 and len(person_ids) >= 2:

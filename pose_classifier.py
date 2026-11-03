@@ -137,12 +137,13 @@ def extract_frame_pose_features(current_kpts, prev_kpts, bbox, neighbor_bboxes=N
     upper_limb_speed = (lw_spd + rw_spd + float(np.linalg.norm(norm_vel[7])) * 10.0 + float(np.linalg.norm(norm_vel[8])) * 10.0) / 4.0
     lower_limb_speed = (float(np.linalg.norm(norm_vel[13])) + float(np.linalg.norm(norm_vel[14])) + float(np.linalg.norm(norm_vel[15])) + float(np.linalg.norm(norm_vel[16]))) * 2.5
 
-    # Guard / Combat Stance: Are wrists elevated near/above shoulders?
+    # Guard / Combat Stance: Wrists elevated near/above shoulders WITH active kinetic velocity
+    # (prevents false alarms when scratching nose, touching hair, or normal gesturing)
     sh_y = (norm_pos[5][1] + norm_pos[6][1]) / 2.0
     guard_metric = 0.0
-    if norm_pos[9][1] < sh_y:  # Left wrist above shoulders
+    if norm_pos[9][1] < sh_y and lw_spd > 1.2:
         guard_metric += 0.5
-    if norm_pos[10][1] < sh_y: # Right wrist above shoulders
+    if norm_pos[10][1] < sh_y and rw_spd > 1.2:
         guard_metric += 0.5
 
     # Torso Lean / Angle
@@ -190,6 +191,7 @@ class StudentPoseTracker:
         self.history = {}       # student_id -> deque of 78-dim feature vectors
         self.last_kpts = {}     # student_id -> last (17, 2) keypoints
         self.last_results = {}  # student_id -> {label, confidence, fight_prob}
+        self.fight_streak = {}  # student_id -> consecutive aggressive frame count
 
         self.device = torch.device("cpu")
         self.model = StudentFightClassifier(input_dim=78, hidden_dim=64, num_classes=2).to(self.device)
@@ -296,8 +298,43 @@ class StudentPoseTracker:
         fight_prob = float(probs[1])
         normal_prob = float(probs[0])
 
-        # Require minimum fight threshold of 0.60 to avoid false positives on simple gestures
-        is_fighting = bool(fight_prob >= 0.60)
+        # Biomechanical Kinetic Gating & Fusion:
+        lw_spd = float(features[68])
+        rw_spd = float(features[69])
+        upper_limb_speed = float(features[70])
+        guard = float(features[72])
+        lunge = float(features[75])
+        neighbor_dist = float(features[76])
+        interaction_hazard = float(features[77])
+
+        strike_intensity = max(lw_spd, rw_spd)
+        combat_energy = (strike_intensity * 0.40) + (upper_limb_speed * 0.30) + (guard * 1.50) + (interaction_hazard * 0.25) + (lunge * 0.30)
+
+        # Hybrid Neuro-Kinetic Fusion:
+        # Case 1: Student is moving with conversational / calm speed (combat_energy < 1.3 and strike_intensity < 1.6)
+        # Even if standing very close to someone, they are in a peaceful conversation!
+        if combat_energy < 1.3 and strike_intensity < 1.6:
+            fight_prob = min(fight_prob * 0.08, 0.02)
+            normal_prob = 1.0 - fight_prob
+            raw_fight = False
+        # Case 2: High physical combat strikes / lunges (combat_energy >= 2.2 or strike_intensity >= 2.2)
+        elif combat_energy >= 2.2 or (strike_intensity >= 2.2 and neighbor_dist < 1.1):
+            fight_prob = max(fight_prob, 0.82 + min(0.16, (combat_energy - 2.0) * 0.06))
+            normal_prob = 1.0 - fight_prob
+            raw_fight = True
+        else:
+            raw_fight = bool(fight_prob >= 0.70)
+
+        # Temporal Hysteresis: Require at least 3 consecutive frames of combat aggression
+        # to eliminate transient flickers or single gestures
+        streak = self.fight_streak.get(student_id, 0)
+        if raw_fight:
+            streak += 1
+        else:
+            streak = max(0, streak - 2)
+        self.fight_streak[student_id] = streak
+
+        is_fighting = (streak >= 3)
         label = "FIGHTING" if is_fighting else "NORMAL"
         confidence = round(fight_prob * 100.0 if is_fighting else normal_prob * 100.0, 1)
 
@@ -320,6 +357,8 @@ class StudentPoseTracker:
                     del self.last_kpts[sid]
                 if sid in self.last_results:
                     del self.last_results[sid]
+                if sid in self.fight_streak:
+                    del self.fight_streak[sid]
 
 
 def draw_student_skeleton(img, kpts, is_fighting=False, pid=1, status_text="NORMAL", confidence=95.0):
