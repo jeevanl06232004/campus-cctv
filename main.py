@@ -294,13 +294,15 @@ class CameraHub:
             is_webcam = (src == "webcam")
 
             if is_webcam:
-                # Automatic Standby: If no client is streaming or polling for > 10s, release webcam hardware!
-                idle_seconds = time.time() - self.last_client_activity
-                if self.active_stream_clients == 0 and idle_seconds > 10.0:
-                    if not self.is_standby:
-                        self.release_camera("All dashboard tabs closed. Camera resting (Hardware LED OFF).")
-                    time.sleep(0.5)
-                    continue
+                with self.lock:
+                    idle_seconds = time.time() - self.last_client_activity
+                    # Only standby if genuinely idle > 15s AND user is not actively requesting live webcam
+                    should_standby = (self.active_stream_clients == 0 and idle_seconds > 15.0 and self.is_standby and not self._need_reconnect)
+                    if should_standby:
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        self.is_standby = False
 
                 working_idx, cap, first_frame = self._find_working_camera()
                 if cap is None:
@@ -403,9 +405,18 @@ class CameraHub:
 
                     if not success or frame is None or frame.size == 0:
                         if not is_webcam:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            # Re-open archive video cleanly from start to ensure seamless continuous looping
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            cap = cv2.VideoCapture(str(video_path))
                             self.analyzer.reset_state()
-                            continue
+                            if cap.isOpened():
+                                success, frame = cap.read()
+                            if not success or frame is None or frame.size == 0:
+                                time.sleep(0.1)
+                                continue
                         else:
                             print("[CameraHub] Frame read dropped on live webcam, will re-probe...")
                             time.sleep(0.2)
@@ -542,24 +553,45 @@ class CameraHub:
         else:
             resolved_source = "webcam"
 
-        with self.condition:
+        with self.lock:
             self.current_source = resolved_source
             current_source = resolved_source
             self._need_reconnect = True
+            # WAKE UP CAMERA IMMEDIATELY: Clear standby & reset idle timers
+            self.is_standby = False
+            self.last_client_activity = time.time()
+            if self.active_cap is not None:
+                try:
+                    self.active_cap.release()
+                except Exception:
+                    pass
+                self.active_cap = None
             self.analyzer.reset_state()
             self.alert_manager.silence_alarm()
+
+        with self.condition:
             self.condition.notify_all()
         return True, resolved_source
 
     def reconnect_camera(self):
         """Forces the capture thread to re-open and probe camera hardware."""
         global current_source
-        with self.condition:
+        with self.lock:
             self.current_source = "webcam"
             current_source = "webcam"
             self._need_reconnect = True
+            self.is_standby = False
+            self.last_client_activity = time.time()
+            if self.active_cap is not None:
+                try:
+                    self.active_cap.release()
+                except Exception:
+                    pass
+                self.active_cap = None
             self.analyzer.reset_state()
             self.alert_manager.silence_alarm()
+
+        with self.condition:
             self.condition.notify_all()
         return True
 
@@ -1441,7 +1473,7 @@ header {
                 <span>Upload Recorded CCTV Clip for Analysis</span>
                 <span style="font-size: 12px; color: var(--text-dim);">MP4, AVI, MOV, MKV (Max 250MB)</span>
             </div>
-            <form id="uploadForm" method="POST" action="/upload" enctype="multipart/form-data">
+            <form id="uploadForm" onsubmit="handleVideoUpload(event)">
                 <div class="upload-dropzone" onclick="document.getElementById('videoFileInput').click()">
                     <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom: 6px;">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -1452,8 +1484,9 @@ header {
                     <p id="uploadFilename" style="font-size: 12px; color: var(--cyan); margin-top: 4px;">Supports WhatsApp fight videos or CCTV archives</p>
                     <input type="file" id="videoFileInput" name="video" class="file-input" accept=".mp4,.avi,.mov,.mkv" onchange="handleFileSelected(this)">
                 </div>
-                <div style="margin-top: 10px; display: flex; justify-content: flex-end;">
-                    <button type="submit" class="btn" style="width: auto; padding: 9px 20px;">Upload & Analyze</button>
+                <div style="margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px; align-items: center;">
+                    <span id="uploadStatusText" style="font-size: 11px; color: #94a3b8;"></span>
+                    <button type="submit" id="btnUploadSubmit" class="btn" style="width: auto; padding: 9px 20px;">Upload & Analyze</button>
                 </div>
             </form>
         </div>
@@ -1857,6 +1890,46 @@ function toggleAudioAlarm() {
 function handleFileSelected(input) {
     if (input.files && input.files[0]) {
         document.getElementById('uploadFilename').textContent = "Selected: " + input.files[0].name;
+        const statusText = document.getElementById('uploadStatusText');
+        if (statusText) statusText.innerHTML = '';
+    }
+}
+
+async function handleVideoUpload(e) {
+    if (e) e.preventDefault();
+    const fileInput = document.getElementById('videoFileInput');
+    if (!fileInput.files || fileInput.files.length === 0) {
+        alert("Please select a video file first.");
+        return;
+    }
+    const file = fileInput.files[0];
+    const formData = new FormData();
+    formData.append('video', file);
+    formData.append('ajax', '1');
+
+    const statusText = document.getElementById('uploadStatusText');
+    const submitBtn = document.getElementById('btnUploadSubmit');
+    if (statusText) statusText.innerHTML = '<span style="color: #38bdf8;">⏳ Uploading (' + (file.size / (1024*1024)).toFixed(1) + ' MB)...</span>';
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.innerText = 'Uploading...'; }
+
+    try {
+        const resp = await fetch('/upload', {
+            method: 'POST',
+            body: formData,
+            headers: {'X-Requested-With': 'XMLHttpRequest'}
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            if (statusText) statusText.innerHTML = '<span style="color: #34d399;">✅ Analyzing ' + data.filename + '</span>';
+            await loadVideos();
+            await setSource(data.filename);
+        } else {
+            if (statusText) statusText.innerHTML = '<span style="color: #f87171;">❌ ' + (data.message || 'Upload failed') + '</span>';
+        }
+    } catch (err) {
+        if (statusText) statusText.innerHTML = '<span style="color: #f87171;">❌ Upload error: ' + err + '</span>';
+    } finally {
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.innerText = 'Upload & Analyze'; }
     }
 }
 
@@ -1914,8 +1987,10 @@ async function setSource(sourceName) {
             if (activeBtn) activeBtn.classList.add('active');
             document.getElementById('currentSourceTag').textContent = 'SOURCE: ' + sourceName.toUpperCase();
 
-            // Instantly reconnect stream with timestamp to load new video immediately
-            feedImg.src = '/video_feed?t=' + Date.now();
+            // Instantly reconnect stream with timestamp to load new feed immediately
+            setTimeout(() => {
+                feedImg.src = '/video_feed?t=' + Date.now();
+            }, 100);
         }
     } catch (e) {
         console.error("Error setting source:", e);
@@ -2713,19 +2788,27 @@ def reconnect_camera_api():
 @app.route("/upload", methods=["POST"])
 def upload_video():
     video = request.files.get("video")
+    is_ajax = (request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.form.get("ajax") == "1")
     if not video or not video.filename:
+        if is_ajax:
+            return jsonify(ok=False, message="No video selected"), 400
         return "No video selected", 400
 
     filename = secure_filename(video.filename)
     extension = Path(filename).suffix.lower()
 
     if extension not in ALLOWED_EXTENSIONS:
+        if is_ajax:
+            return jsonify(ok=False, message=f"Unsupported format {extension}"), 400
         return f"Unsupported format {extension}", 400
 
     dest = UPLOAD_FOLDER / filename
     video.save(dest)
 
-    camera_hub.set_source(filename)
+    ok, res = camera_hub.set_source(filename)
+
+    if is_ajax:
+        return jsonify(ok=True, filename=filename, message=f"Video '{filename}' uploaded successfully!")
 
     return f"""<script>
         alert("Video '{filename}' uploaded successfully! Analyzing now.");
