@@ -465,13 +465,17 @@ class CCTVAnalyzer:
                     res2 = student_dl_results.get(id2, {})
                     f_prob1 = res1.get("fight_prob", 0.0)
                     f_prob2 = res2.get("fight_prob", 0.0)
+                    cat1 = res1.get("gesture_category", "CALM")
+                    cat2 = res2.get("gesture_category", "CALM")
 
                     is_pair_fighting = False
-                    if norm_dist < 1.0 or has_overlap:
+                    if norm_dist < 0.95 or has_overlap:
                         if dl_flagged:
                             is_pair_fighting = True
-                        elif (f_prob1 >= 0.55 or f_prob2 >= 0.55) and combat_motion >= 38.0:
-                            is_pair_fighting = True
+                        elif (f_prob1 >= 0.70 or f_prob2 >= 0.70) and combat_motion >= 45.0:
+                            # Strict guard: If both are engaged in playful/funny gestures, NEVER flag as fight
+                            if cat1 != "PLAYFUL_GESTURE" and cat2 != "PLAYFUL_GESTURE":
+                                is_pair_fighting = True
 
                     if is_pair_fighting:
                         fighting_pairs.append({
@@ -524,23 +528,40 @@ class CCTVAnalyzer:
 
         # Draw Illuminated Skeleton & Bounding Badges for Each Student
         for pid, (x1, y1, x2, y2) in persons.items():
-            dl_info = student_dl_results.get(pid, {"label": "NORMAL", "confidence": 98.0, "is_fighting": False})
+            dl_info = student_dl_results.get(pid, {
+                "label": "NORMAL", "confidence": 98.0, "is_fighting": False,
+                "gesture_category": "CALM", "gesture_type": "Calm Conversation",
+                "facial_demeanor": "Relaxed"
+            })
             is_f = (pid in individual_fighting) and fight_active
+            g_cat = dl_info.get("gesture_category", "CALM")
 
-            # Draw AI Skeleton
+            # Draw AI Skeleton with dynamic demeanor coloring
             kpts = self.cached_kpts.get(pid)
             if kpts is not None:
-                draw_student_skeleton(annotated, kpts, is_fighting=is_f, pid=pid, status_text=dl_info["label"], confidence=dl_info["confidence"])
+                draw_student_skeleton(annotated, kpts, is_fighting=is_f, pid=pid,
+                                      status_text=dl_info["label"], confidence=dl_info["confidence"],
+                                      gesture_category=g_cat)
 
-            color = (40, 40, 235) if is_f else (0, 230, 118)
-            tag = f"Student #{pid} [{dl_info['label']}: {dl_info['confidence']}%]"
+            if is_f:
+                color = (40, 40, 235)      # Red alert
+                tag = f"Student #{pid} [SERIOUS COMBAT: {dl_info['confidence']}%]"
+                text_col = (255, 255, 255)
+            elif g_cat == "PLAYFUL_GESTURE":
+                color = (0, 215, 255)      # Amber Gold (BGR) - Casual & Safe
+                tag = f"Student #{pid} [PLAYFUL GESTURE: SAFE] | Demeanor: CASUAL"
+                text_col = (10, 20, 30)
+            else:
+                color = (0, 230, 118)      # Emerald Green
+                tag = f"Student #{pid} [NORMAL: {dl_info['confidence']}%]"
+                text_col = (255, 255, 255)
 
             self._draw_corner_box(annotated, x1, y1, x2, y2, color, thickness=2 if not is_f else 3)
-            self._draw_face_target(annotated, x1, y1, x2, y2, pid, is_f)
+            self._draw_face_target(annotated, x1, y1, x2, y2, pid, is_f, dl_info.get("facial_demeanor", "Relaxed"), g_cat)
 
-            (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
             cv2.rectangle(annotated, (x1, max(0, y1 - 22)), (x1 + tw + 10, y1), color, -1)
-            cv2.putText(annotated, tag, (x1 + 5, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(annotated, tag, (x1 + 5, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.44, text_col, 1, cv2.LINE_AA)
 
         # Draw combat link lines ONLY if actual fight detected
         if fight_active and len(person_ids) >= 2:
@@ -581,6 +602,31 @@ class CCTVAnalyzer:
 
         involved_labels = [f"Student #{pid}" for pid in sorted(list(individual_fighting))]
 
+        # Determine aggregate gesture and demeanor telemetry
+        primary_gesture = "Calm Conversation"
+        primary_demeanor = "Relaxed / Smiling"
+        primary_category = "CALM"
+        max_strike_speed = 0.0
+        max_combat_energy = 0.0
+
+        for pid, dl_info in student_dl_results.items():
+            spd = dl_info.get("strike_speed", 0.0)
+            nrg = dl_info.get("combat_energy", 0.0)
+            cat = dl_info.get("gesture_category", "CALM")
+            if spd > max_strike_speed:
+                max_strike_speed = spd
+            if nrg > max_combat_energy:
+                max_combat_energy = nrg
+
+            if cat == "SERIOUS_COMBAT":
+                primary_category = "SERIOUS_COMBAT"
+                primary_gesture = dl_info.get("gesture_type", "Violent Combat Strike")
+                primary_demeanor = dl_info.get("facial_demeanor", "Hostile Combat Stance")
+            elif cat == "PLAYFUL_GESTURE" and primary_category != "SERIOUS_COMBAT":
+                primary_category = "PLAYFUL_GESTURE"
+                primary_gesture = dl_info.get("gesture_type", "Playful / Funny Gesture")
+                primary_demeanor = dl_info.get("facial_demeanor", "Casual Upright")
+
         metrics = {
             "camera_connected": True,
             "motion_score": round(global_motion_score, 2),
@@ -590,11 +636,24 @@ class CCTVAnalyzer:
             "persons_count": len(persons),
             "ai_ready": bool(is_model_ready),
             "ai_model": "Deep Learning Bi-GRU Skeleton Pose",
+            "kinetic_telemetry": {
+                "primary_gesture": primary_gesture,
+                "primary_demeanor": primary_demeanor,
+                "gesture_category": primary_category,
+                "strike_speed": round(max_strike_speed, 2),
+                "combat_energy": round(max_combat_energy, 2),
+                "safe_gesture_filter": "ACTIVE",
+                "is_combat": bool(fight_active and len(persons) >= 2)
+            },
             "student_predictions": {
                 f"Student #{pid}": {
                     "behavior": student_dl_results.get(pid, {}).get("label", "NORMAL"),
                     "confidence": student_dl_results.get(pid, {}).get("confidence", 98.0),
-                    "fight_prob": student_dl_results.get(pid, {}).get("fight_prob", 0.02)
+                    "fight_prob": student_dl_results.get(pid, {}).get("fight_prob", 0.02),
+                    "gesture": student_dl_results.get(pid, {}).get("gesture_type", "Calm Movement"),
+                    "demeanor": student_dl_results.get(pid, {}).get("facial_demeanor", "Relaxed"),
+                    "category": student_dl_results.get(pid, {}).get("gesture_category", "CALM"),
+                    "strike_speed": student_dl_results.get(pid, {}).get("strike_speed", 0.0)
                 } for pid in persons.keys()
             },
             "persons": [f"Student #{pid}" for pid in sorted(list(persons.keys()))],
@@ -624,10 +683,10 @@ class CCTVAnalyzer:
         cv2.line(img, (x2, y2), (x2 - clen, y2), color, thickness)
         cv2.line(img, (x2, y2), (x2, y2 - clen), color, thickness)
 
-    def _draw_face_target(self, img, x1, y1, x2, y2, pid, is_fighting=False):
+    def _draw_face_target(self, img, x1, y1, x2, y2, pid, is_fighting=False, demeanor="Relaxed", gesture_category="CALM"):
         """
         Draws a face/head target reticle on the upper 25% of the person.
-        Visibly confirms the face lock: [FACE LOCKED: Person #1].
+        Visibly confirms the face demeanor classification.
         """
         h_box = y2 - y1
         w_box = x2 - x1
@@ -639,7 +698,15 @@ class CCTVAnalyzer:
         fy1 = max(0, y1 + int(h_box * 0.04))
         fy2 = min(img.shape[0], fy1 + face_h)
 
-        face_color = (40, 40, 235) if is_fighting else (255, 220, 0)  # Bright Cyan (BGR) for normal
+        if is_fighting:
+            face_color = (40, 40, 235)  # Crimson Red
+            face_tag = f"FACE: HOSTILE [Student #{pid}]"
+        elif gesture_category == "PLAYFUL_GESTURE":
+            face_color = (0, 215, 255)  # Amber Gold
+            face_tag = f"FACE: CASUAL DEMEANOR [SAFE]"
+        else:
+            face_color = (255, 220, 0)  # Bright Cyan
+            face_tag = f"FACE: RELAXED [Student #{pid}]"
 
         c_len = max(4, min(10, face_w // 4))
         # Top-left
@@ -662,6 +729,4 @@ class CCTVAnalyzer:
         cv2.line(img, (fcx, fcy - 4), (fcx, fcy + 4), face_color, 1)
 
         # Face lock label
-        face_tag = f"FACE LOCKED: Person #{pid}"
         cv2.putText(img, face_tag, (fx1, max(14, fy1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, face_color, 1, cv2.LINE_AA)
-

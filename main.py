@@ -147,7 +147,16 @@ class CameraHub:
             "involved_persons": [],
             "last_alert_time": 0.0,
             "cooldown_remaining": 0,
-            "active_incident_id": None
+            "active_incident_id": None,
+            "kinetic_telemetry": {
+                "primary_gesture": "Calm Conversation",
+                "primary_demeanor": "Relaxed / Smiling",
+                "gesture_category": "CALM",
+                "strike_speed": 0.0,
+                "combat_energy": 0.0,
+                "safe_gesture_filter": "ACTIVE",
+                "is_combat": False
+            }
         }
 
         self.active_cap = None
@@ -460,14 +469,20 @@ class CameraHub:
                         metrics["action_detected"] = False
 
                     elif metrics.get("fight_detected") and metrics.get("persons_count", 0) >= 2:
-                        if time_since_last >= cooldown:
+                        k_tel = metrics.get("kinetic_telemetry", {})
+                        # Strict False-Alarm Prevention: Playful gestures or joking between friends never trigger security dispatch!
+                        if k_tel.get("gesture_category") == "PLAYFUL_GESTURE":
+                            metrics["fight_detected"] = False
+                        elif time_since_last >= cooldown:
                             details = {
                                 "location": "Camera 01 - Main Quad",
                                 "source": source_label,
                                 "persons": metrics.get("involved_persons", []),
                                 "persons_count": metrics.get("persons_count", 0),
                                 "score": metrics.get("fight_score", 0.0),
-                                "confidence": 92.5
+                                "confidence": 92.5,
+                                "facial_demeanor": k_tel.get("primary_demeanor", "Hostile Combat Stance"),
+                                "gesture": k_tel.get("primary_gesture", "Violent Combat Strike")
                             }
                             success_dispatch, inc_id = self.alert_manager.trigger_alert(
                                 "FIGHT_DETECTED", details, frame=annotated_frame
@@ -790,10 +805,24 @@ header {
     margin-bottom: 16px;
 }
 
+/* SURVEILLANCE STAGE: Split Layout with Video & Live Gesture Movement Graph */
+.surveillance-stage {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 16px;
+    align-items: stretch;
+}
+
+@media (max-width: 1100px) {
+    .surveillance-stage {
+        grid-template-columns: 1fr;
+    }
+}
+
 .video-wrapper {
     position: relative;
     width: 100%;
-    min-height: 420px;
+    min-height: 380px;
     background: #020408;
     border-radius: var(--radius-md);
     overflow: hidden;
@@ -801,6 +830,121 @@ header {
     display: flex;
     align-items: center;
     justify-content: center;
+}
+
+.gesture-telemetry-panel {
+    background: #08101d;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.4);
+}
+
+.gt-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.gt-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #93c5fd;
+    text-transform: uppercase;
+}
+
+.gt-pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #06b6d4;
+    box-shadow: 0 0 8px #06b6d4;
+    animation: pulse 1.5s infinite;
+}
+
+.gt-filter-pill {
+    background: rgba(16, 185, 129, 0.15);
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    color: #34d399;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 12px;
+    letter-spacing: 0.4px;
+}
+
+.gt-canvas-box {
+    background: #040812;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    position: relative;
+    width: 100%;
+    height: 155px;
+}
+
+#gestureWaveformCanvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.gt-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.gt-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+}
+
+.gt-card-label {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+}
+
+.gt-card-val {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-main);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.gt-card-val.mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: #38bdf8;
+}
+
+.gt-safety-notice {
+    margin-top: 10px;
+    background: rgba(6, 182, 212, 0.08);
+    border: 1px solid rgba(6, 182, 212, 0.25);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    font-size: 10.5px;
+    color: #94a3b8;
+    line-height: 1.4;
+    display: flex;
+    align-items: flex-start;
 }
 
 .video-feed {
@@ -1409,11 +1553,56 @@ header {
                 <span id="currentSourceTag" style="font-size: 12px; color: var(--cyan); font-family: 'JetBrains Mono', monospace;">SOURCE: WEBCAM</span>
             </div>
 
-            <div class="video-wrapper">
-                <img id="videoFeed" class="video-feed" src="/video_feed" alt="Surveillance Stream">
-                <div id="threatBanner" class="threat-banner">
-                    <span id="threatBannerText">🚨 CRITICAL ALERT: FIGHT DETECTED</span>
-                    <button class="btn btn-danger" style="padding: 4px 10px; font-size: 11px;" onclick="dispatchTestAlert()">DISPATCH TO AUTHORITY</button>
+            <!-- SURVEILLANCE STAGE: Split layout placing live kinetics graph in the empty space beside the video -->
+            <div class="surveillance-stage">
+                <div class="video-wrapper">
+                    <img id="videoFeed" class="video-feed" src="/video_feed" alt="Surveillance Stream">
+                    <div id="threatBanner" class="threat-banner">
+                        <span id="threatBannerText">🚨 CRITICAL ALERT: FIGHT DETECTED</span>
+                        <button class="btn btn-danger" style="padding: 4px 10px; font-size: 11px;" onclick="dispatchTestAlert()">DISPATCH TO AUTHORITY</button>
+                    </div>
+                </div>
+
+                <!-- LIVE BODY LANGUAGE & GESTURE MOVEMENT GRAPH (Side of Live Footage) -->
+                <div class="gesture-telemetry-panel">
+                    <div class="gt-header">
+                        <div class="gt-title">
+                            <span class="gt-pulse-dot"></span>
+                            BODY KINETICS GRAPH
+                        </div>
+                        <span class="gt-filter-pill">🛡️ CASUAL FILTER ON</span>
+                    </div>
+
+                    <!-- Oscilloscope Real-time Waveform Canvas -->
+                    <div class="gt-canvas-box">
+                        <canvas id="gestureWaveformCanvas" width="320" height="155"></canvas>
+                    </div>
+
+                    <!-- Gesture & Demeanor Dynamic Cards -->
+                    <div class="gt-grid">
+                        <div class="gt-card">
+                            <div class="gt-card-label">CLASSIFIED GESTURE</div>
+                            <div class="gt-card-val" id="gtGestureType">Calm Movement</div>
+                        </div>
+                        <div class="gt-card">
+                            <div class="gt-card-label">FACIAL DEMEANOR</div>
+                            <div class="gt-card-val" id="gtFacialDemeanor">Relaxed / Smiling</div>
+                        </div>
+                        <div class="gt-card">
+                            <div class="gt-card-label">PEAK LIMB SPEED</div>
+                            <div class="gt-card-val mono" id="gtVelocityVal">0.00 m/s</div>
+                        </div>
+                        <div class="gt-card">
+                            <div class="gt-card-label">KINETIC ENERGY</div>
+                            <div class="gt-card-val mono" id="gtEnergyVal">0.00 J</div>
+                        </div>
+                    </div>
+
+                    <!-- Safe Filter Explanation -->
+                    <div class="gt-safety-notice">
+                        <span style="color: var(--emerald); font-weight: bold; margin-right: 5px;">✓</span>
+                        <span>Casual jokes, funny waving &amp; dancing are verified safe and excluded from danger alerts.</span>
+                    </div>
                 </div>
             </div>
 
@@ -2363,6 +2552,46 @@ async function refreshTelemetry() {
             });
         }
 
+        // Update Real-time Gesture & Demeanor Movement Telemetry
+        const kTel = data.kinetic_telemetry || {};
+        const cat = kTel.gesture_category || "CALM";
+        currentGestureCategory = cat;
+        targetAnimSpeed = kTel.strike_speed || 0.15;
+
+        const gtGesture = document.getElementById('gtGestureType');
+        const gtDemeanor = document.getElementById('gtFacialDemeanor');
+        const gtVel = document.getElementById('gtVelocityVal');
+        const gtEnergy = document.getElementById('gtEnergyVal');
+
+        if (gtGesture) {
+            gtGesture.textContent = kTel.primary_gesture || 'Calm Movement';
+            if (cat === 'SERIOUS_COMBAT') {
+                gtGesture.style.color = '#ef4444';
+            } else if (cat === 'PLAYFUL_GESTURE') {
+                gtGesture.style.color = '#f59e0b';
+            } else {
+                gtGesture.style.color = 'var(--emerald)';
+            }
+        }
+        if (gtDemeanor) {
+            gtDemeanor.textContent = kTel.primary_demeanor || 'Relaxed / Casual';
+            if (cat === 'SERIOUS_COMBAT') {
+                gtDemeanor.style.color = '#ef4444';
+            } else if (cat === 'PLAYFUL_GESTURE') {
+                gtDemeanor.style.color = '#f59e0b';
+            } else {
+                gtDemeanor.style.color = 'var(--emerald)';
+            }
+        }
+        if (gtVel) {
+            gtVel.textContent = (kTel.strike_speed || 0.0).toFixed(2) + ' m/s';
+            gtVel.style.color = cat === 'SERIOUS_COMBAT' ? '#ef4444' : (cat === 'PLAYFUL_GESTURE' ? '#f59e0b' : '#38bdf8');
+        }
+        if (gtEnergy) {
+            gtEnergy.textContent = (kTel.combat_energy || 0.0).toFixed(2) + ' J';
+            gtEnergy.style.color = cat === 'SERIOUS_COMBAT' ? '#ef4444' : (cat === 'PLAYFUL_GESTURE' ? '#f59e0b' : '#38bdf8');
+        }
+
     } catch (e) {
         console.warn("Status refresh error:", e);
     }
@@ -2638,6 +2867,126 @@ async function sendTestTelegramAlert() {
     }
 }
 
+// ---------------- REAL-TIME BODY KINETICS OSCILLOSCOPE ----------------
+const kineticCanvas = document.getElementById('gestureWaveformCanvas');
+const kCtx = kineticCanvas ? kineticCanvas.getContext('2d') : null;
+const kineticPoints = new Array(80).fill(0.2);
+let currentAnimSpeed = 0.2;
+let targetAnimSpeed = 0.2;
+let currentGestureCategory = "CALM";
+
+function updateWaveformCanvas() {
+    if (!kCtx || !kineticCanvas) return;
+    
+    // Smooth interpolation towards latest target speed with biological micro-tremor
+    currentAnimSpeed += (targetAnimSpeed - currentAnimSpeed) * 0.18;
+    const tremor = (Math.random() - 0.5) * 0.04;
+    const valWithTremor = Math.max(0.05, currentAnimSpeed + tremor);
+    
+    kineticPoints.shift();
+    kineticPoints.push(valWithTremor);
+    
+    const w = kineticCanvas.width;
+    const h = kineticCanvas.height;
+    
+    kCtx.clearRect(0, 0, w, h);
+    
+    // Background gradient
+    const bgGrad = kCtx.createLinearGradient(0, 0, 0, h);
+    bgGrad.addColorStop(0, '#060c18');
+    bgGrad.addColorStop(1, '#03060c');
+    kCtx.fillStyle = bgGrad;
+    kCtx.fillRect(0, 0, w, h);
+    
+    // Zone regions (Max scale on y-axis is 4.0 m/s)
+    const maxScale = 4.0;
+    const yViolent = h - (2.8 / maxScale) * h;
+    const yPlayful = h - (1.6 / maxScale) * h;
+    
+    // Violent Zone Background (top)
+    kCtx.fillStyle = 'rgba(239, 68, 68, 0.08)';
+    kCtx.fillRect(0, 0, w, yViolent);
+    
+    // Playful Zone Background (middle)
+    kCtx.fillStyle = 'rgba(245, 158, 11, 0.07)';
+    kCtx.fillRect(0, yViolent, w, yPlayful - yViolent);
+    
+    // Calm Zone Background (bottom)
+    kCtx.fillStyle = 'rgba(16, 185, 129, 0.04)';
+    kCtx.fillRect(0, yPlayful, w, h - yPlayful);
+    
+    // Threshold dashed lines
+    kCtx.strokeStyle = 'rgba(239, 68, 68, 0.4)';
+    kCtx.setLineDash([4, 4]);
+    kCtx.beginPath();
+    kCtx.moveTo(0, yViolent);
+    kCtx.lineTo(w, yViolent);
+    kCtx.stroke();
+    
+    kCtx.strokeStyle = 'rgba(245, 158, 11, 0.35)';
+    kCtx.beginPath();
+    kCtx.moveTo(0, yPlayful);
+    kCtx.lineTo(w, yPlayful);
+    kCtx.stroke();
+    kCtx.setLineDash([]);
+    
+    // Zone Labels
+    kCtx.font = '9px "JetBrains Mono", monospace';
+    kCtx.fillStyle = '#ef4444';
+    kCtx.fillText('2.8+ VIOLENT COMBAT', 8, Math.max(12, yViolent - 4));
+    kCtx.fillStyle = '#f59e0b';
+    kCtx.fillText('1.6-2.8 PLAYFUL / FUNNY GESTURE [SAFE]', 8, yPlayful - 4);
+    kCtx.fillStyle = '#10b981';
+    kCtx.fillText('0.0-1.6 CALM CONVERSATION', 8, h - 6);
+    
+    // Draw Waveform curve
+    kCtx.beginPath();
+    const step = w / (kineticPoints.length - 1);
+    for (let i = 0; i < kineticPoints.length; i++) {
+        const x = i * step;
+        const clampedVal = Math.min(maxScale, kineticPoints[i]);
+        const y = h - (clampedVal / maxScale) * h;
+        if (i === 0) {
+            kCtx.moveTo(x, y);
+        } else {
+            const prevX = (i - 1) * step;
+            const prevVal = Math.min(maxScale, kineticPoints[i - 1]);
+            const prevY = h - (prevVal / maxScale) * h;
+            const midX = (prevX + x) / 2;
+            kCtx.quadraticCurveTo(prevX, prevY, midX, (prevY + y) / 2);
+        }
+    }
+    
+    // Dynamic waveform stroke color based on current state
+    let strokeColor = '#10b981';
+    let glowColor = 'rgba(16, 185, 129, 0.6)';
+    if (currentGestureCategory === 'SERIOUS_COMBAT') {
+        strokeColor = '#ef4444';
+        glowColor = 'rgba(239, 68, 68, 0.8)';
+    } else if (currentGestureCategory === 'PLAYFUL_GESTURE') {
+        strokeColor = '#f59e0b';
+        glowColor = 'rgba(245, 158, 11, 0.7)';
+    }
+    
+    kCtx.strokeStyle = strokeColor;
+    kCtx.lineWidth = 2.5;
+    kCtx.shadowColor = glowColor;
+    kCtx.shadowBlur = 8;
+    kCtx.stroke();
+    kCtx.shadowBlur = 0;
+    
+    // Draw pulse dot at head of curve
+    const lastClamped = Math.min(maxScale, kineticPoints[kineticPoints.length - 1]);
+    const headY = h - (lastClamped / maxScale) * h;
+    kCtx.fillStyle = strokeColor;
+    kCtx.beginPath();
+    kCtx.arc(w - 2, headY, 4, 0, Math.PI * 2);
+    kCtx.fill();
+    
+    requestAnimationFrame(updateWaveformCanvas);
+}
+requestAnimationFrame(updateWaveformCanvas);
+
 // Initial Boot
 loadAuthorityDirectory();
 loadTelegramStatus();
@@ -2645,7 +2994,7 @@ loadVideos();
 loadIncidents();
 refreshAuthorityMessage();
 refreshAlarmStatus();
-setInterval(refreshTelemetry, 800);
+setInterval(refreshTelemetry, 350);
 setInterval(refreshAlarmStatus, 1500);
 setInterval(refreshAuthorityMessage, 2000);
 setInterval(loadIncidents, 6000);

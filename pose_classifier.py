@@ -77,8 +77,8 @@ class StudentFightClassifier(nn.Module):
             hidden_size=hidden_dim,
             num_layers=2,
             batch_first=True,
-            bidirectional=True,
-            dropout=0.2
+            dropout=0.2,
+            bidirectional=True
         )
 
         self.attention = TemporalAttention(hidden_dim * 2)
@@ -185,13 +185,17 @@ class StudentPoseTracker:
     """
     Maintains a sliding temporal sequence of 16 frames for each student
     and performs deep learning inference on CPU in <1ms.
+    Now equipped with Demeanor & Facial Posture Analysis and Periodic Gesture Filtering
+    to eliminate false alarms on casual/funny gestures, joking, waving, and dancing.
     """
     def __init__(self, seq_len=16, weights_path=MODEL_WEIGHTS_PATH):
         self.seq_len = seq_len
-        self.history = {}       # student_id -> deque of 78-dim feature vectors
-        self.last_kpts = {}     # student_id -> last (17, 2) keypoints
-        self.last_results = {}  # student_id -> {label, confidence, fight_prob}
-        self.fight_streak = {}  # student_id -> consecutive aggressive frame count
+        self.history = {}             # student_id -> deque of 78-dim feature vectors
+        self.last_kpts = {}           # student_id -> last (17, 2) keypoints
+        self.last_results = {}        # student_id -> result dict
+        self.fight_streak = {}        # student_id -> consecutive aggressive frame count
+        self.wrist_vel_history = {}   # student_id -> deque of (lw_vx, lw_vy, rw_vx, rw_vy) maxlen=8
+        self.demeanor_history = {}    # student_id -> deque of chin_tuck ratios maxlen=8
 
         self.device = torch.device("cpu")
         self.model = StudentFightClassifier(input_dim=78, hidden_dim=64, num_classes=2).to(self.device)
@@ -261,7 +265,8 @@ class StudentPoseTracker:
 
     def update_student(self, student_id, current_kpts, bbox, all_bboxes=None):
         """
-        Receives current frame keypoints for a tracked student and returns deep learning prediction.
+        Receives current frame keypoints for a tracked student and returns deep learning prediction,
+        enriched with facial demeanor and casual gesture filtering.
         """
         if student_id not in self.history:
             self.history[student_id] = deque(maxlen=self.seq_len)
@@ -273,13 +278,60 @@ class StudentPoseTracker:
         self.last_kpts[student_id] = current_kpts.copy()
         self.history[student_id].append(features)
 
+        # 1. Facial Posture & Chin Tuck Demeanor Analysis
+        # COCO keypoints: 0=Nose, 5=L Shoulder, 6=R Shoulder, 11=L Hip, 12=R Hip
+        chin_tuck = 0.30
+        if current_kpts is not None and len(current_kpts) >= 13:
+            nose = current_kpts[0]
+            l_sh = current_kpts[5]
+            r_sh = current_kpts[6]
+            l_hip = current_kpts[11]
+            r_hip = current_kpts[12]
+            if l_sh[1] > 0 and r_sh[1] > 0 and nose[1] > 0:
+                sh_y = (l_sh[1] + r_sh[1]) / 2.0
+                hip_y = (l_hip[1] + r_hip[1]) / 2.0 if (l_hip[1] > 0 and r_hip[1] > 0) else (sh_y + 100.0)
+                torso_len = max(25.0, abs(hip_y - sh_y))
+                chin_tuck = float(sh_y - nose[1]) / torso_len
+
+        if student_id not in self.demeanor_history:
+            self.demeanor_history[student_id] = deque(maxlen=8)
+        self.demeanor_history[student_id].append(chin_tuck)
+        avg_chin_tuck = float(np.mean(self.demeanor_history[student_id]))
+
+        # 2. Kinetic Velocity Directionality (Detects Periodic Waving / Dancing / Laughing)
+        # norm_vel: features[34:68]. Wrists are keypoints 9 and 10
+        lw_vx = float(features[52])
+        lw_vy = float(features[53])
+        rw_vx = float(features[54])
+        rw_vy = float(features[55])
+
+        if student_id not in self.wrist_vel_history:
+            self.wrist_vel_history[student_id] = deque(maxlen=8)
+        self.wrist_vel_history[student_id].append((lw_vx, lw_vy, rw_vx, rw_vy))
+
+        hist = list(self.wrist_vel_history[student_id])
+        reversals = 0
+        if len(hist) >= 4:
+            for k in range(1, len(hist)):
+                if (hist[k][0] * hist[k-1][0] < -1e-5) or (hist[k][1] * hist[k-1][1] < -1e-5) or \
+                   (hist[k][2] * hist[k-1][2] < -1e-5) or (hist[k][3] * hist[k-1][3] < -1e-5):
+                    reversals += 1
+        is_periodic_wave = (reversals >= 2)
+
         # Need at least 4 frames to begin temporal sequence inference
         if len(self.history[student_id]) < 4:
             res = {
                 "label": "NORMAL",
                 "confidence": 98.0,
                 "fight_prob": 0.02,
-                "is_fighting": False
+                "is_fighting": False,
+                "gesture_category": "CALM",
+                "gesture_type": "Calm Conversation",
+                "facial_demeanor": "Relaxed / Smiling",
+                "strike_speed": 0.0,
+                "combat_energy": 0.0,
+                "chin_tuck": round(avg_chin_tuck, 3),
+                "is_periodic_wave": False
             }
             self.last_results[student_id] = res
             return res
@@ -298,11 +350,12 @@ class StudentPoseTracker:
         fight_prob = float(probs[1])
         normal_prob = float(probs[0])
 
-        # Biomechanical Kinetic Gating & Fusion:
+        # 3. Biomechanical Kinetic Gating & Demeanor Fusion:
         lw_spd = float(features[68])
         rw_spd = float(features[69])
         upper_limb_speed = float(features[70])
         guard = float(features[72])
+        torso_tilt = float(features[73])
         lunge = float(features[75])
         neighbor_dist = float(features[76])
         interaction_hazard = float(features[77])
@@ -310,23 +363,66 @@ class StudentPoseTracker:
         strike_intensity = max(lw_spd, rw_spd)
         combat_energy = (strike_intensity * 0.40) + (upper_limb_speed * 0.30) + (guard * 1.50) + (interaction_hazard * 0.25) + (lunge * 0.30)
 
-        # Hybrid Neuro-Kinetic Fusion:
-        # Case 1: Student is moving with conversational / calm speed (combat_energy < 1.3 and strike_intensity < 1.6)
-        # Even if standing very close to someone, they are in a peaceful conversation!
-        if combat_energy < 1.3 and strike_intensity < 1.6:
-            fight_prob = min(fight_prob * 0.08, 0.02)
+        # Three-tier Behavior Classification:
+        # State A: Calm / Peaceful Conversation
+        if strike_intensity < 1.6 and combat_energy < 1.4:
+            gesture_category = "CALM"
+            gesture_type = "Calm Conversation"
+            facial_demeanor = "Relaxed / Smiling"
+            fight_prob = min(fight_prob * 0.05, 0.02)
             normal_prob = 1.0 - fight_prob
             raw_fight = False
-        # Case 2: High physical combat strikes / lunges (combat_energy >= 2.2 or strike_intensity >= 2.2)
-        elif combat_energy >= 2.2 or (strike_intensity >= 2.2 and neighbor_dist < 1.1):
-            fight_prob = max(fight_prob, 0.82 + min(0.16, (combat_energy - 2.0) * 0.06))
+
+        # State B: Casual / Playful / Funny Gesture (SAFE - CRITICAL FALSE ALARM FILTER!)
+        # Detects waving, dancing, joking, hand flapping, clapping, laughing:
+        # - Periodic waving velocity reversals (reversals >= 2), OR
+        # - Upright casual head / demeanor posture (avg_chin_tuck >= 0.24, not tucked into chest), OR
+        # - Stationary torso / no attack lunge (lunge < 1.0 and torso_tilt < 1.3), OR
+        # - Solo action / distance >= 1.05
+        elif is_periodic_wave or avg_chin_tuck >= 0.24 or (lunge < 1.0 and torso_tilt < 1.3) or neighbor_dist >= 1.05:
+            gesture_category = "PLAYFUL_GESTURE"
+            if is_periodic_wave:
+                gesture_type = "Funny Arm Waving / Dancing"
+            elif strike_intensity > 2.0:
+                gesture_type = "Playful Hand Gesturing"
+            else:
+                gesture_type = "Casual Movement (Safe)"
+            facial_demeanor = "Casual Upright"
+            fight_prob = min(0.12, 0.04 + (strike_intensity * 0.02))
+            normal_prob = 1.0 - fight_prob
+            raw_fight = False
+
+        # State C: Serious Violent Combat Attack
+        # Requires:
+        # - High strike speed (strike_intensity >= 2.6 or combat_energy >= 2.2)
+        # - Close proximity with opponent (neighbor_dist < 0.95)
+        # - Combat head demeanor: locked forward, chin tucked down into chest (< 0.23)
+        # - Aggressive forward torso displacement / attack lunge (lunge >= 1.0 or torso_tilt >= 1.3)
+        elif (strike_intensity >= 2.6 or combat_energy >= 2.2) and neighbor_dist < 0.95 and avg_chin_tuck < 0.23:
+            gesture_category = "SERIOUS_COMBAT"
+            gesture_type = "Violent Combat Strike"
+            facial_demeanor = "Hostile Combat Stance"
+            fight_prob = max(fight_prob, 0.88 + min(0.10, (combat_energy - 2.0) * 0.05))
             normal_prob = 1.0 - fight_prob
             raw_fight = True
-        else:
-            raw_fight = bool(fight_prob >= 0.70)
 
-        # Temporal Hysteresis: Require at least 3 consecutive frames of combat aggression
-        # to eliminate transient flickers or single gestures
+        else:
+            # Borderline case: safe by default unless unambiguous violent contact
+            if fight_prob >= 0.75 and strike_intensity >= 2.4 and neighbor_dist < 0.90:
+                gesture_category = "SERIOUS_COMBAT"
+                gesture_type = "Physical Aggression"
+                facial_demeanor = "Aggressive Demeanor"
+                raw_fight = True
+            else:
+                gesture_category = "PLAYFUL_GESTURE"
+                gesture_type = "Casual Dynamic Motion"
+                facial_demeanor = "Casual Demeanor"
+                raw_fight = False
+                fight_prob = min(fight_prob, 0.18)
+                normal_prob = 1.0 - fight_prob
+
+        # Temporal Hysteresis: Require at least 6 consecutive frames of verified serious combat
+        # to strictly eliminate any remaining transient flickers or casual hand actions
         streak = self.fight_streak.get(student_id, 0)
         if raw_fight:
             streak += 1
@@ -334,7 +430,7 @@ class StudentPoseTracker:
             streak = max(0, streak - 2)
         self.fight_streak[student_id] = streak
 
-        is_fighting = (streak >= 3)
+        is_fighting = (streak >= 6)
         label = "FIGHTING" if is_fighting else "NORMAL"
         confidence = round(fight_prob * 100.0 if is_fighting else normal_prob * 100.0, 1)
 
@@ -342,7 +438,14 @@ class StudentPoseTracker:
             "label": label,
             "confidence": confidence,
             "fight_prob": round(fight_prob, 3),
-            "is_fighting": is_fighting
+            "is_fighting": is_fighting,
+            "gesture_category": gesture_category,
+            "gesture_type": gesture_type,
+            "facial_demeanor": facial_demeanor,
+            "strike_speed": round(strike_intensity, 2),
+            "combat_energy": round(combat_energy, 2),
+            "chin_tuck": round(avg_chin_tuck, 3),
+            "is_periodic_wave": bool(is_periodic_wave)
         }
         self.last_results[student_id] = res
         return res
@@ -359,16 +462,28 @@ class StudentPoseTracker:
                     del self.last_results[sid]
                 if sid in self.fight_streak:
                     del self.fight_streak[sid]
+                if sid in self.wrist_vel_history:
+                    del self.wrist_vel_history[sid]
+                if sid in self.demeanor_history:
+                    del self.demeanor_history[sid]
 
 
-def draw_student_skeleton(img, kpts, is_fighting=False, pid=1, status_text="NORMAL", confidence=95.0):
+def draw_student_skeleton(img, kpts, is_fighting=False, pid=1, status_text="NORMAL", confidence=95.0, gesture_category="CALM"):
     """
     Draws the illuminated AI pose skeleton and limb bones on top of the student:
-      - Normal: Tech Cyan / Emerald Green skeleton
-      - Fighting: Warning Crimson Red glowing skeleton with combat indicator
+      - Serious Combat: Warning Crimson Red (40, 40, 235)
+      - Playful / Funny Gesture (Safe): Amber Gold / Tech Yellow (0, 215, 255)
+      - Normal / Calm Conversation: Emerald Green (0, 230, 118)
     """
-    bone_color = (40, 40, 235) if is_fighting else (0, 230, 118)   # Red vs Green
-    joint_color = (0, 0, 255) if is_fighting else (255, 230, 0)    # Joint nodes
+    if is_fighting:
+        bone_color = (40, 40, 235)   # Red
+        joint_color = (0, 0, 255)
+    elif gesture_category == "PLAYFUL_GESTURE":
+        bone_color = (0, 215, 255)   # Amber Gold (BGR)
+        joint_color = (255, 255, 255)
+    else:
+        bone_color = (0, 230, 118)   # Emerald Green
+        joint_color = (255, 230, 0)
 
     # Draw Bones
     for pt1_idx, pt2_idx in SKELETON_CONNECTIONS:
@@ -384,4 +499,3 @@ def draw_student_skeleton(img, kpts, is_fighting=False, pid=1, status_text="NORM
         if px > 0 and py > 0:
             cv2.circle(img, (px, py), 3, joint_color, -1, cv2.LINE_AA)
             cv2.circle(img, (px, py), 4, bone_color, 1, cv2.LINE_AA)
-

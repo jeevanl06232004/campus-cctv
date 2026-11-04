@@ -644,6 +644,11 @@ class AlertManager:
 
         persons_str = ", ".join(details.get("persons", [])) if details.get("persons") else f"{auth_name} Verified Action"
 
+        demeanor_str = details.get('facial_demeanor')
+        gesture_str = details.get('gesture')
+        demeanor_line = f"FACIAL DEMEANOR : {demeanor_str}\n" if demeanor_str else ""
+        gesture_line = f"GESTURE VERIFIED: {gesture_str} [Serious Threat]\n" if gesture_str else ""
+
         text_message = (
             f"🚨 CAMPUS CCTV EMERGENCY NOTIFICATION ALARM\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -654,6 +659,8 @@ class AlertManager:
             f"CAMERA LOCATION : {details.get('location', 'Camera 01 - Main Quad')}\n"
             f"ACTION TIME     : {timestamp_str}\n"
             f"ACTION TARGETS  : {persons_str}\n"
+            f"{demeanor_line}"
+            f"{gesture_line}"
             f"ACTION INTENSITY: {details.get('score', 0):.1f}%\n"
             f"SECURITY ADVICE : Immediate intervention requested on campus."
         )
