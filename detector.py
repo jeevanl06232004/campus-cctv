@@ -468,13 +468,17 @@ class CCTVAnalyzer:
                     cat1 = res1.get("gesture_category", "CALM")
                     cat2 = res2.get("gesture_category", "CALM")
 
+                    spd1 = res1.get("strike_speed", 0.0)
+                    spd2 = res2.get("strike_speed", 0.0)
+
                     is_pair_fighting = False
-                    if norm_dist < 0.95 or has_overlap:
+                    if norm_dist < 1.45 or has_overlap:
                         if dl_flagged:
                             is_pair_fighting = True
-                        elif (f_prob1 >= 0.70 or f_prob2 >= 0.70) and combat_motion >= 45.0:
-                            # Strict guard: If both are engaged in playful/funny gestures, NEVER flag as fight
-                            if cat1 != "PLAYFUL_GESTURE" and cat2 != "PLAYFUL_GESTURE":
+                        elif (spd1 >= 2.8 or spd2 >= 2.8) and (cat1 == "SERIOUS_COMBAT" or cat2 == "SERIOUS_COMBAT" or combat_motion >= 8.0):
+                            is_pair_fighting = True
+                        elif (f_prob1 >= 0.50 or f_prob2 >= 0.50) and combat_motion >= 12.0:
+                            if not (cat1 == "PLAYFUL_GESTURE" and cat2 == "PLAYFUL_GESTURE" and spd1 < 2.8 and spd2 < 2.8):
                                 is_pair_fighting = True
 
                     if is_pair_fighting:
@@ -489,15 +493,23 @@ class CCTVAnalyzer:
                         })
                         individual_fighting.add(id1)
                         individual_fighting.add(id2)
-                        max_pair_combat_score = max(max_pair_combat_score, combat_motion, 55.0)
+                        max_pair_combat_score = max(max_pair_combat_score, combat_motion, 60.0)
 
-        # Temporal filter with decay (eliminates transient tracking glitches)
-        if len(fighting_pairs) > 0 and len(person_ids) >= 2:
+        # Single-student violent behavior check (solo raging / violent punches in front of camera)
+        if len(person_ids) >= 1 and not individual_fighting:
+            for pid in person_ids:
+                s_res = student_dl_results.get(pid, {})
+                if s_res.get("is_fighting") or (s_res.get("gesture_category") == "SERIOUS_COMBAT" and s_res.get("strike_speed", 0) >= 2.8):
+                    individual_fighting.add(pid)
+                    max_pair_combat_score = max(max_pair_combat_score, 75.0)
+
+        # FAST RECOGNITION Temporal filter: Require only 2 frames for instant response (<70ms!)
+        if len(individual_fighting) > 0:
             self.fight_consecutive_frames += 1
         else:
-            self.fight_consecutive_frames = max(0, self.fight_consecutive_frames - 2)
+            self.fight_consecutive_frames = max(0, self.fight_consecutive_frames - 1)
 
-        fight_active = (self.fight_consecutive_frames >= 4)
+        fight_active = (self.fight_consecutive_frames >= 2)
 
         # High motion assessment: ONLY if multiple persons are in frame and high disturbance
         if global_motion_score >= 20.0 and len(person_ids) >= 2:
@@ -631,7 +643,7 @@ class CCTVAnalyzer:
             "camera_connected": True,
             "motion_score": round(global_motion_score, 2),
             "fight_score": round(max_pair_combat_score, 2),
-            "fight_detected": bool(fight_active and len(persons) >= 2),
+            "fight_detected": bool(fight_active and len(persons) >= 1),
             "high_motion_detected": bool(high_motion_active and len(persons) >= 2),
             "persons_count": len(persons),
             "ai_ready": bool(is_model_ready),
@@ -657,7 +669,7 @@ class CCTVAnalyzer:
                 } for pid in persons.keys()
             },
             "persons": [f"Student #{pid}" for pid in sorted(list(persons.keys()))],
-            "involved_persons": involved_labels if (fight_active and len(persons) >= 2) else [],
+            "involved_persons": involved_labels if fight_active else [],
             "source": source_name,
             "timestamp": time.time()
         }

@@ -364,8 +364,22 @@ class StudentPoseTracker:
         combat_energy = (strike_intensity * 0.40) + (upper_limb_speed * 0.30) + (guard * 1.50) + (interaction_hazard * 0.25) + (lunge * 0.30)
 
         # Three-tier Behavior Classification:
-        # State A: Calm / Peaceful Conversation
-        if strike_intensity < 1.6 and combat_energy < 1.4:
+        # Tier 1: Serious Violent Combat Attack / Bad Behavior
+        # High strike speed (>= 2.8 m/s) or high combat energy (>= 1.8), in interacting proximity or active lunging,
+        # OR deep neural model detects fight (fight_prob >= 0.65 and strike_intensity >= 2.0).
+        is_combat_strike = (strike_intensity >= 2.8 or combat_energy >= 1.8 or (fight_prob >= 0.65 and strike_intensity >= 2.0))
+        is_in_range = (neighbor_dist < 1.45 or lunge >= 0.6 or torso_tilt >= 1.2)
+
+        if is_combat_strike and is_in_range:
+            gesture_category = "SERIOUS_COMBAT"
+            gesture_type = "Violent Combat Strike"
+            facial_demeanor = "Hostile Combat Stance"
+            fight_prob = max(fight_prob, 0.88 + min(0.11, (strike_intensity - 2.8) * 0.04))
+            normal_prob = 1.0 - fight_prob
+            raw_fight = True
+
+        # Tier 2: Calm / Peaceful Conversation
+        elif strike_intensity < 1.6 and combat_energy < 1.3:
             gesture_category = "CALM"
             gesture_type = "Calm Conversation"
             facial_demeanor = "Relaxed / Smiling"
@@ -373,13 +387,9 @@ class StudentPoseTracker:
             normal_prob = 1.0 - fight_prob
             raw_fight = False
 
-        # State B: Casual / Playful / Funny Gesture (SAFE - CRITICAL FALSE ALARM FILTER!)
-        # Detects waving, dancing, joking, hand flapping, clapping, laughing:
-        # - Periodic waving velocity reversals (reversals >= 2), OR
-        # - Upright casual head / demeanor posture (avg_chin_tuck >= 0.24, not tucked into chest), OR
-        # - Stationary torso / no attack lunge (lunge < 1.0 and torso_tilt < 1.3), OR
-        # - Solo action / distance >= 1.05
-        elif is_periodic_wave or avg_chin_tuck >= 0.24 or (lunge < 1.0 and torso_tilt < 1.3) or neighbor_dist >= 1.05:
+        # Tier 3: Casual / Playful / Funny Gesture (SAFE - FALSE ALARM FILTER)
+        # Moderate arm speeds (1.6 to 2.8 m/s) but NO violent strike, stationary torso, friendly waving
+        else:
             gesture_category = "PLAYFUL_GESTURE"
             if is_periodic_wave:
                 gesture_type = "Funny Arm Waving / Dancing"
@@ -392,45 +402,16 @@ class StudentPoseTracker:
             normal_prob = 1.0 - fight_prob
             raw_fight = False
 
-        # State C: Serious Violent Combat Attack
-        # Requires:
-        # - High strike speed (strike_intensity >= 2.6 or combat_energy >= 2.2)
-        # - Close proximity with opponent (neighbor_dist < 0.95)
-        # - Combat head demeanor: locked forward, chin tucked down into chest (< 0.23)
-        # - Aggressive forward torso displacement / attack lunge (lunge >= 1.0 or torso_tilt >= 1.3)
-        elif (strike_intensity >= 2.6 or combat_energy >= 2.2) and neighbor_dist < 0.95 and avg_chin_tuck < 0.23:
-            gesture_category = "SERIOUS_COMBAT"
-            gesture_type = "Violent Combat Strike"
-            facial_demeanor = "Hostile Combat Stance"
-            fight_prob = max(fight_prob, 0.88 + min(0.10, (combat_energy - 2.0) * 0.05))
-            normal_prob = 1.0 - fight_prob
-            raw_fight = True
-
-        else:
-            # Borderline case: safe by default unless unambiguous violent contact
-            if fight_prob >= 0.75 and strike_intensity >= 2.4 and neighbor_dist < 0.90:
-                gesture_category = "SERIOUS_COMBAT"
-                gesture_type = "Physical Aggression"
-                facial_demeanor = "Aggressive Demeanor"
-                raw_fight = True
-            else:
-                gesture_category = "PLAYFUL_GESTURE"
-                gesture_type = "Casual Dynamic Motion"
-                facial_demeanor = "Casual Demeanor"
-                raw_fight = False
-                fight_prob = min(fight_prob, 0.18)
-                normal_prob = 1.0 - fight_prob
-
-        # Temporal Hysteresis: Require at least 6 consecutive frames of verified serious combat
-        # to strictly eliminate any remaining transient flickers or casual hand actions
+        # FAST RECOGNITION HYSTERESIS:
+        # 2 consecutive frames of combat aggression triggers fighting immediately (<70ms response time!)
         streak = self.fight_streak.get(student_id, 0)
         if raw_fight:
             streak += 1
         else:
-            streak = max(0, streak - 2)
+            streak = max(0, streak - 1)
         self.fight_streak[student_id] = streak
 
-        is_fighting = (streak >= 6)
+        is_fighting = (streak >= 2)
         label = "FIGHTING" if is_fighting else "NORMAL"
         confidence = round(fight_prob * 100.0 if is_fighting else normal_prob * 100.0, 1)
 
