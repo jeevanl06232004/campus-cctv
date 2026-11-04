@@ -361,20 +361,20 @@ class StudentPoseTracker:
         interaction_hazard = float(features[77])
 
         strike_intensity = max(lw_spd, rw_spd)
-        combat_energy = (strike_intensity * 0.40) + (upper_limb_speed * 0.30) + (guard * 1.50) + (interaction_hazard * 0.25) + (lunge * 0.30)
+        # Physical kinetic energy without proximity hazard inflation
+        combat_energy = (strike_intensity * 0.55) + (upper_limb_speed * 0.35) + (lunge * 0.30)
 
         # Three-tier Behavior Classification:
         # Tier 1: Serious Violent Combat Attack / Bad Behavior
-        # High strike speed (>= 2.8 m/s) or high combat energy (>= 1.8), in interacting proximity or active lunging,
-        # OR deep neural model detects fight (fight_prob >= 0.65 and strike_intensity >= 2.0).
-        is_combat_strike = (strike_intensity >= 2.8 or combat_energy >= 1.8 or (fight_prob >= 0.65 and strike_intensity >= 2.0))
+        # High strike speed (>= 3.8 m/s) or high combat energy (>= 2.5) in proximity or lunging
+        is_combat_strike = (strike_intensity >= 3.8 or (strike_intensity >= 2.8 and combat_energy >= 2.4 and (lunge >= 0.6 or torso_tilt >= 1.2)) or (fight_prob >= 0.85 and strike_intensity >= 3.0))
         is_in_range = (neighbor_dist < 1.45 or lunge >= 0.6 or torso_tilt >= 1.2)
 
         if is_combat_strike and is_in_range:
             gesture_category = "SERIOUS_COMBAT"
             gesture_type = "Violent Combat Strike"
             facial_demeanor = "Hostile Combat Stance"
-            fight_prob = max(fight_prob, 0.88 + min(0.11, (strike_intensity - 2.8) * 0.04))
+            fight_prob = max(fight_prob, 0.88 + min(0.11, (strike_intensity - 3.8) * 0.04))
             normal_prob = 1.0 - fight_prob
             raw_fight = True
 
@@ -388,7 +388,7 @@ class StudentPoseTracker:
             raw_fight = False
 
         # Tier 3: Casual / Playful / Funny Gesture (SAFE - FALSE ALARM FILTER)
-        # Moderate arm speeds (1.6 to 2.8 m/s) but NO violent strike, stationary torso, friendly waving
+        # Moderate arm speeds (1.6 to 3.8 m/s) with stationary torso or periodic waving
         else:
             gesture_category = "PLAYFUL_GESTURE"
             if is_periodic_wave:
@@ -402,8 +402,8 @@ class StudentPoseTracker:
             normal_prob = 1.0 - fight_prob
             raw_fight = False
 
-        # FAST RECOGNITION HYSTERESIS:
-        # 2 consecutive frames of combat aggression triggers fighting immediately (<70ms response time!)
+        # Robust Temporal Hysteresis: Require 4 consecutive frames of violent aggression
+        # Completely eliminates transient 1-2 frame tracking jumps while reacting in 130ms for real fights
         streak = self.fight_streak.get(student_id, 0)
         if raw_fight:
             streak += 1
@@ -411,7 +411,7 @@ class StudentPoseTracker:
             streak = max(0, streak - 1)
         self.fight_streak[student_id] = streak
 
-        is_fighting = (streak >= 2)
+        is_fighting = (streak >= 4)
         label = "FIGHTING" if is_fighting else "NORMAL"
         confidence = round(fight_prob * 100.0 if is_fighting else normal_prob * 100.0, 1)
 
