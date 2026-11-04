@@ -95,40 +95,65 @@ def get_available_videos():
 
 class CameraHub:
     """
-    Centralized singleton camera & video capture engine.
-    Runs a dedicated background worker thread that captures frames, runs CCTVAnalyzer,
-    and encodes JPEG images.
-    All Flask clients receive the latest frame from this single pipeline,
-    eliminating any camera hardware lockouts, race conditions, or duplicate YOLO processing.
+    Centralized dual-capture camera and video analyzer engine.
+    Supports simultaneous execution of:
+      1. Live Laptop Webcam feed (CAM 01): Never turns off when clips are uploaded.
+      2. Uploaded CCTV Clip feed (CAM 02): Analyzed simultaneously with YOLO pose and Bi-GRU.
+    Flask clients receive continuous MJPEG streams from independent pipelines without lockouts.
     """
     def __init__(self, analyzer, alert_manager, upload_folder):
         self.analyzer = analyzer
         self.alert_manager = alert_manager
         self.upload_folder = Path(upload_folder)
 
-        self.lock = threading.Lock()
-        self.condition = threading.Condition(self.lock)
+        # Synchronization locks
+        self.live_lock = threading.Lock()
+        self.live_condition = threading.Condition(self.live_lock)
 
-        self.current_source = "webcam"
+        self.archive_lock = threading.Lock()
+        self.archive_condition = threading.Condition(self.archive_lock)
+
         self.current_camera_index = 0
         self.available_cameras = [0]
 
+        # Live webcam state
+        self.live_cap = None
+        self.live_connected = False
+        self.latest_live_jpeg = None
+        self.latest_live_annotated = None
+        self.latest_live_raw = None
+        self.live_frame_id = 0
+
+        # Archive video state
+        self.archive_cap = None
+        self.archive_source = None  # None = Live-only; filename = Simultaneous mode
+        self.latest_archive_jpeg = None
+        self.latest_archive_annotated = None
+        self.latest_archive_raw = None
+        self.archive_frame_id = 0
+
+        # Backward-compatibility pointers
+        self.current_source = "webcam"
         self.latest_jpeg = None
         self.latest_annotated_frame = None
         self.latest_raw_frame = None
         self.frame_id = 0
 
-        # Immediately publish initial standby HUD frame so /video_feed NEVER stalls on client connect!
+        # Generate initial standby frames immediately so streams never block on connect
         try:
             init_standby = self._create_standby_frame(
                 "LIVE WEBCAM CONNECTING...",
-                "Initializing camera hardware video feed..."
+                "Initializing surveillance video feeds..."
             )
             ret, buf = cv2.imencode(".jpg", init_standby, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ret:
-                self.latest_jpeg = buf.tobytes()
+                bytes_data = buf.tobytes()
+                self.latest_live_jpeg = bytes_data
+                self.latest_archive_jpeg = bytes_data
+                self.latest_jpeg = bytes_data
                 self.latest_annotated_frame = init_standby
                 self.latest_raw_frame = init_standby
+                self.live_frame_id = 1
                 self.frame_id = 1
         except Exception as e:
             print(f"[CameraHub] Init standby frame notice: {e}")
@@ -136,6 +161,8 @@ class CameraHub:
         self.current_metrics = {
             "camera_connected": False,
             "source": "webcam",
+            "archive_active": False,
+            "archive_source": None,
             "motion_score": 0.0,
             "fight_score": 0.0,
             "fight_detected": False,
@@ -159,66 +186,81 @@ class CameraHub:
             }
         }
 
-        self.active_cap = None
         self.active_stream_clients = 0
         self.last_client_activity = time.time()
         self.is_standby = False
 
         self._running = True
-        self._need_reconnect = False
-        self._thread = threading.Thread(target=self._worker_loop, name="CameraHubWorker", daemon=True)
-        self._thread.start()
+        self._need_live_reconnect = False
+
+        # Start persistent live webcam worker thread
+        self._live_thread = threading.Thread(target=self._live_worker_loop, name="CameraHubLiveWorker", daemon=True)
+        self._live_thread.start()
+
+        # Archive worker thread
+        self._archive_thread = None
 
     def heartbeat(self):
-        """Notifies the engine that a client is actively viewing or polling."""
-        with self.lock:
+        """Notifies engine that a client is actively viewing."""
+        with self.live_lock:
             self.last_client_activity = time.time()
             if self.is_standby:
                 self.is_standby = False
-                self._need_reconnect = True
-        with self.condition:
-            self.condition.notify_all()
+                self._need_live_reconnect = True
+        with self.live_condition:
+            self.live_condition.notify_all()
+        with self.archive_condition:
+            self.archive_condition.notify_all()
 
     def client_connected(self):
-        with self.lock:
+        with self.live_lock:
             self.active_stream_clients += 1
             self.last_client_activity = time.time()
             if self.is_standby:
                 self.is_standby = False
-                self._need_reconnect = True
-        with self.condition:
-            self.condition.notify_all()
+                self._need_live_reconnect = True
+        with self.live_condition:
+            self.live_condition.notify_all()
 
     def client_disconnected(self):
-        with self.lock:
+        with self.live_lock:
             self.active_stream_clients = max(0, self.active_stream_clients - 1)
             self.last_client_activity = time.time()
 
     def release_camera(self, message="Webcam hardware released (LED OFF). Open or refresh dashboard to resume."):
         """Immediately releases camera hardware so physical camera LED turns off."""
-        with self.lock:
-            if self.active_cap is not None:
+        with self.live_lock:
+            if self.live_cap is not None:
                 try:
-                    self.active_cap.release()
+                    self.live_cap.release()
                 except Exception as e:
                     print(f"[CameraHub] Notice releasing active camera: {e}")
-                self.active_cap = None
+                self.live_cap = None
             self.is_standby = True
+            self.live_connected = False
             self.current_metrics["camera_connected"] = False
             standby = self._create_standby_frame("● CAMERA HARDWARE RELEASED", message)
             ret, buffer = cv2.imencode(".jpg", standby, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ret:
-                self.latest_jpeg = buffer.tobytes()
-                self.latest_annotated_frame = standby
+                self.latest_live_jpeg = buffer.tobytes()
+                self.latest_jpeg = self.latest_live_jpeg
+                self.live_frame_id += 1
                 self.frame_id += 1
-        with self.condition:
-            self.condition.notify_all()
+        with self.live_condition:
+            self.live_condition.notify_all()
         print("[CameraHub] Camera hardware released. Physical LED should be OFF.")
 
     def stop(self):
-        """Completely terminates worker thread and guarantees hardware camera release."""
+        """Completely terminates worker threads and releases camera hardware."""
         self._running = False
         self.release_camera("System terminated.")
+        with self.archive_lock:
+            if self.archive_cap is not None:
+                try:
+                    self.archive_cap.release()
+                except Exception:
+                    pass
+                self.archive_cap = None
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -286,152 +328,241 @@ class CameraHub:
 
         cv2.putText(img, title, (95, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
         cv2.putText(img, message, (95, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-        cv2.putText(img, "Retrying live camera handshake...", (95, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
+        cv2.putText(img, "Scanning camera hardware...", (95, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
         return img
 
-    def _worker_loop(self):
-        import numpy as np
+    def _fallback_metrics(self, source_label):
+        return {
+            "camera_connected": True,
+            "motion_score": 0.0,
+            "fight_score": 0.0,
+            "fight_detected": False,
+            "high_motion_detected": False,
+            "persons_count": 0,
+            "persons": [],
+            "involved_persons": [],
+            "source": source_label,
+            "timestamp": time.time(),
+            "kinetic_telemetry": {
+                "primary_gesture": "Calm Movement",
+                "primary_demeanor": "Relaxed / Casual",
+                "gesture_category": "CALM",
+                "strike_speed": 0.0,
+                "combat_energy": 0.0,
+                "safe_gesture_filter": "ACTIVE",
+                "is_combat": False
+            }
+        }
+
+    def _handle_danger_alert(self, annotated_frame, metrics, source_label):
+        now = time.time()
+        cooldown = self.alert_manager.config.get("cooldown_seconds", 25)
+        time_since_last = now - self.alert_manager.last_alert_time
+        cooldown_left = max(0, int(cooldown - time_since_last))
+
+        has_danger = metrics.get("fight_detected") and len(metrics.get("involved_persons", [])) > 0
+        if has_danger and time_since_last >= cooldown:
+            fighters = metrics.get("involved_persons", [])
+            k_tel = metrics.get("kinetic_telemetry", {})
+            details = {
+                "location": "Camera 01 - Main Quad Surveillance",
+                "source": source_label,
+                "persons": fighters,
+                "persons_count": metrics.get("persons_count", len(fighters)),
+                "score": max(metrics.get("fight_score", 0.0), 65.0),
+                "confidence": 95.0,
+                "facial_demeanor": k_tel.get("primary_demeanor", "Hostile Combat Stance"),
+                "gesture": k_tel.get("primary_gesture", "Violent Combat Strike")
+            }
+            print(f"[CameraHub] !!! DANGER ALERT TRIGGERED FOR AUTHORITY: {details} !!!")
+            success_dispatch, inc_id = self.alert_manager.trigger_alert(
+                "FIGHT_DETECTED", details, frame=annotated_frame
+            )
+            if success_dispatch:
+                metrics["active_incident_id"] = inc_id
+
+        metrics["cooldown_remaining"] = cooldown_left
+
+    def _live_worker_loop(self):
+        """Dedicated worker thread for live webcam. Never shuts off when clips are uploaded."""
         global current_source, current_metrics, latest_annotated_frame
 
         while self._running:
-            with self.lock:
-                src = self.current_source
-                cam_idx = self.current_camera_index
-                self._need_reconnect = False
-
-            cap = None
-            is_webcam = (src == "webcam")
-
-            if is_webcam:
-                with self.lock:
-                    idle_seconds = time.time() - self.last_client_activity
-                    # Only standby if genuinely idle > 15s AND user is not actively requesting live webcam
-                    should_standby = (self.active_stream_clients == 0 and idle_seconds > 15.0 and self.is_standby and not self._need_reconnect)
-                    if should_standby:
-                        time.sleep(0.5)
-                        continue
-                    else:
-                        self.is_standby = False
-
-                working_idx, cap, first_frame = self._find_working_camera()
-                if cap is None:
-                    with self.lock:
-                        self.current_metrics["camera_connected"] = False
-                        self.current_metrics["source"] = "webcam (Connecting...)"
-                        current_metrics = self.current_metrics.copy()
-                        standby = self._create_standby_frame(
-                            "LIVE WEBCAM CONNECTING...",
-                            "Verifying camera device (DirectShow / MediaFoundation)"
-                        )
-                        ret, buffer = cv2.imencode(".jpg", standby, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        if ret:
-                            self.latest_jpeg = buffer.tobytes()
-                            self.latest_annotated_frame = standby
-                            latest_annotated_frame = standby
-                            self.frame_id += 1
-                            self.condition.notify_all()
-                    time.sleep(1.0)
-                    continue
-                else:
-                    with self.lock:
-                        self.active_cap = cap
-                        self.is_standby = False
-                        self.current_camera_index = working_idx
-                        cam_idx = working_idx
-                        self.current_metrics["camera_connected"] = True
-                        self.current_metrics["source"] = "webcam"
-                        current_metrics = self.current_metrics.copy()
-
-                    # Immediately broadcast the first frame already captured during camera handshake!
-                    if first_frame is not None and first_frame.size > 0:
-                        try:
-                            source_label = "Webcam (Live Camera)"
-                            fh, fw = first_frame.shape[:2]
-                            if max(fh, fw) > 800:
-                                scale = 800.0 / max(fh, fw)
-                                first_frame = cv2.resize(first_frame, (int(fw * scale), int(fh * scale)), interpolation=cv2.INTER_AREA)
-
-                            annotated_first, metrics_first = self.analyzer.process_frame(first_frame, source_name=source_label)
-                            ret, buffer = cv2.imencode(".jpg", annotated_first, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                            if ret:
-                                with self.condition:
-                                    self.latest_jpeg = buffer.tobytes()
-                                    self.latest_annotated_frame = annotated_first.copy()
-                                    self.latest_raw_frame = first_frame.copy()
-                                    self.current_metrics = metrics_first
-                                    current_metrics = metrics_first
-                                    latest_annotated_frame = self.latest_annotated_frame
-                                    self.frame_id += 1
-                                    self.condition.notify_all()
-                        except Exception as e:
-                            print(f"[CameraHub] First frame broadcast exception: {e}")
-            else:
-                video_path = self.upload_folder / src
-                if not video_path.exists():
-                    video_path = self.upload_folder / secure_filename(src)
-                if not video_path.exists():
-                    print(f"[CameraHub] Archive video {src} not found. Returning to webcam.")
-                    with self.lock:
-                        self.current_source = "webcam"
-                        current_source = "webcam"
-                    continue
-                cap = cv2.VideoCapture(str(video_path))
-                if not cap.isOpened():
-                    print(f"[CameraHub] Could not open archive video: {video_path}")
-                    with self.lock:
-                        self.current_source = "webcam"
-                        current_source = "webcam"
+            with self.live_lock:
+                if self.is_standby and not self._need_live_reconnect:
                     time.sleep(0.5)
                     continue
-                with self.lock:
-                    self.active_cap = cap
-                    self.current_metrics["camera_connected"] = True
-                    self.current_metrics["source"] = src
-                    current_metrics = self.current_metrics.copy()
+                self._need_live_reconnect = False
 
-            with self.lock:
-                self.analyzer.reset_state()
+            working_idx, cap, first_frame = self._find_working_camera()
+            if cap is None:
+                with self.live_lock:
+                    self.live_connected = False
+                    self.current_metrics["camera_connected"] = False
+                    standby = self._create_standby_frame(
+                        "LIVE WEBCAM CONNECTING...",
+                        "Verifying camera device (DirectShow / MediaFoundation)"
+                    )
+                    ret, buf = cv2.imencode(".jpg", standby, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ret:
+                        self.latest_live_jpeg = buf.tobytes()
+                        self.latest_live_annotated = standby
+                        self.live_frame_id += 1
+                        with self.archive_lock:
+                            if self.archive_source is None:
+                                self.latest_jpeg = self.latest_live_jpeg
+                                self.latest_annotated_frame = standby
+                                self.frame_id += 1
+                        self.live_condition.notify_all()
+                time.sleep(1.0)
+                continue
+
+            with self.live_lock:
+                self.live_cap = cap
+                self.live_connected = True
+                self.is_standby = False
+                self.current_camera_index = working_idx
+                self.current_metrics["camera_connected"] = True
 
             try:
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                if fps <= 0 or fps > 60:
-                    fps = 30.0
-                frame_delay = 1.0 / fps
-
-                source_label = "Webcam (Live Camera)" if is_webcam else f"Archive: {src}"
-
                 while self._running:
-                    with self.lock:
-                        if self.current_source != src or self._need_reconnect or (is_webcam and self.current_camera_index != cam_idx):
+                    with self.live_lock:
+                        if self._need_live_reconnect or self.is_standby:
                             break
-                        # Check idle timeout while camera is active
-                        if is_webcam and self.active_stream_clients == 0 and (time.time() - self.last_client_activity > 10.0):
-                            print("[CameraHub] No active browser clients detected for 10s. Putting camera to sleep...")
+
+                    success, frame = cap.read()
+                    if not success or frame is None or frame.size == 0:
+                        time.sleep(0.1)
+                        break
+
+                    fh, fw = frame.shape[:2]
+                    if max(fh, fw) > 800:
+                        scale = 800.0 / max(fh, fw)
+                        frame = cv2.resize(frame, (int(fw * scale), int(fh * scale)), interpolation=cv2.INTER_AREA)
+
+                    with self.archive_lock:
+                        archive_active = (self.archive_source is not None)
+
+                    if not archive_active:
+                        # Live webcam is PRIMARY analysis feed
+                        source_label = "Webcam (Live Camera)"
+                        try:
+                            annotated_frame, metrics = self.analyzer.process_frame(frame, source_name=source_label)
+                        except Exception as e:
+                            print(f"[CameraHub] Live analysis error: {e}")
+                            annotated_frame = frame.copy()
+                            metrics = self._fallback_metrics(source_label)
+
+                        self._handle_danger_alert(annotated_frame, metrics, source_label)
+                        metrics["camera_connected"] = True
+                        metrics["source"] = "webcam"
+                        metrics["archive_active"] = False
+                        metrics["archive_source"] = None
+
+                        with self.live_lock:
+                            self.current_metrics = metrics
+                            current_metrics = metrics
+                    else:
+                        # Live webcam runs SIMULTANEOUSLY with professional CCTV HUD
+                        annotated_frame = frame.copy()
+                        h, w = annotated_frame.shape[:2]
+                        # Top surveillance banner
+                        cv2.rectangle(annotated_frame, (0, 0), (w, 36), (15, 20, 28), -1)
+                        cv2.circle(annotated_frame, (18, 18), 6, (0, 230, 118), -1)
+                        cv2.putText(annotated_frame, "CAM 01: LIVE CAMPUS WEBCAM [ONLINE]", (32, 23),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 230, 118), 2)
+                        time_str = time.strftime('%H:%M:%S')
+                        cv2.putText(annotated_frame, f"LIVE {time_str}", (w - 120, 23),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+                        # Bottom status bar
+                        cv2.rectangle(annotated_frame, (0, h - 24), (w, h), (15, 20, 28), -1)
+                        cv2.putText(annotated_frame, "● SIMULTANEOUS LIVE SURVEILLANCE FEED", (12, h - 7),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 215, 255), 1)
+
+                    ret, buffer = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ret:
+                        jpeg_bytes = buffer.tobytes()
+                        with self.live_lock:
+                            self.latest_live_jpeg = jpeg_bytes
+                            self.latest_live_annotated = annotated_frame.copy()
+                            self.latest_live_raw = frame.copy()
+                            self.live_frame_id += 1
+                            if not archive_active:
+                                self.latest_jpeg = jpeg_bytes
+                                self.latest_annotated_frame = self.latest_live_annotated
+                                latest_annotated_frame = self.latest_annotated_frame
+                                self.frame_id += 1
+                        with self.live_condition:
+                            self.live_condition.notify_all()
+
+                    time.sleep(0.033)
+            finally:
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                with self.live_lock:
+                    if self.live_cap is cap:
+                        self.live_cap = None
+                        self.live_connected = False
+
+    def _archive_worker_loop(self):
+        """Worker thread for uploaded recorded CCTV clips running simultaneously with live webcam."""
+        global current_source, current_metrics, latest_annotated_frame
+
+        while self._running:
+            with self.archive_lock:
+                src = self.archive_source
+            if not src:
+                time.sleep(0.2)
+                continue
+
+            video_path = self.upload_folder / src
+            if not video_path.exists():
+                video_path = self.upload_folder / secure_filename(src)
+            if not video_path.exists():
+                print(f"[CameraHub] Archive video {src} not found.")
+                with self.archive_lock:
+                    self.archive_source = None
+                continue
+
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                print(f"[CameraHub] Could not open archive video {video_path}")
+                with self.archive_lock:
+                    self.archive_source = None
+                time.sleep(0.5)
+                continue
+
+            with self.archive_lock:
+                self.archive_cap = cap
+
+            self.analyzer.reset_state()
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0 or fps > 60:
+                fps = 30.0
+            frame_delay = 1.0 / fps
+            source_label = f"Archive: {src}"
+
+            try:
+                while self._running:
+                    with self.archive_lock:
+                        if self.archive_source != src:
                             break
 
                     t_start = time.time()
                     success, frame = cap.read()
 
                     if not success or frame is None or frame.size == 0:
-                        if not is_webcam:
-                            # Re-open archive video cleanly from start to ensure seamless continuous looping
-                            try:
-                                cap.release()
-                            except Exception:
-                                pass
-                            cap = cv2.VideoCapture(str(video_path))
-                            self.analyzer.reset_state()
-                            if cap.isOpened():
-                                success, frame = cap.read()
-                            if not success or frame is None or frame.size == 0:
-                                time.sleep(0.1)
-                                continue
-                        else:
-                            print("[CameraHub] Frame read dropped on live webcam, will re-probe...")
-                            time.sleep(0.2)
-                            break
+                        # Seamless continuous loop from start of clip
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        self.analyzer.reset_state()
+                        success, frame = cap.read()
+                        if not success or frame is None or frame.size == 0:
+                            time.sleep(0.1)
+                            continue
 
-                    # Normalize resolution for smooth 30 FPS streaming
                     fh, fw = frame.shape[:2]
                     if max(fh, fw) > 800:
                         scale = 800.0 / max(fh, fw)
@@ -439,98 +570,64 @@ class CameraHub:
 
                     try:
                         annotated_frame, metrics = self.analyzer.process_frame(frame, source_name=source_label)
-                    except Exception as proc_err:
-                        print(f"[CameraHub] Analysis error: {proc_err}")
+                    except Exception as e:
+                        print(f"[CameraHub] Archive analysis error: {e}")
                         annotated_frame = frame.copy()
-                        metrics = {
-                            "camera_connected": True,
-                            "motion_score": 0.0,
-                            "fight_score": 0.0,
-                            "fight_detected": False,
-                            "high_motion_detected": False,
-                            "persons_count": 0,
-                            "persons": [],
-                            "involved_persons": [],
-                            "source": source_label,
-                            "timestamp": time.time()
-                        }
+                        metrics = self._fallback_metrics(source_label)
 
-                    now = time.time()
-                    cooldown = self.alert_manager.config.get("cooldown_seconds", 25)
-                    time_since_last = now - self.alert_manager.last_alert_time
-                    cooldown_left = max(0, int(cooldown - time_since_last))
+                    self._handle_danger_alert(annotated_frame, metrics, source_label)
 
-                    # Danger Alert & Authority Dispatch Trigger (Instant dispatch upon detection)
-                    has_danger = metrics.get("fight_detected") and len(metrics.get("involved_persons", [])) > 0
-
-                    if has_danger:
-                        k_tel = metrics.get("kinetic_telemetry", {})
-                        if time_since_last >= cooldown:
-                            fighters = metrics.get("involved_persons", [])
-                            details = {
-                                "location": "Camera 01 - Main Quad",
-                                "source": source_label,
-                                "persons": fighters,
-                                "persons_count": metrics.get("persons_count", len(fighters)),
-                                "score": max(metrics.get("fight_score", 0.0), 65.0),
-                                "confidence": 95.0,
-                                "facial_demeanor": k_tel.get("primary_demeanor", "Hostile Combat Stance"),
-                                "gesture": k_tel.get("primary_gesture", "Violent Combat Strike")
-                            }
-                            print(f"[CameraHub] !!! DANGER ALERT TRIGGERED FOR AUTHORITY: {details} !!!")
-                            success_dispatch, inc_id = self.alert_manager.trigger_alert(
-                                "FIGHT_DETECTED", details, frame=annotated_frame
-                            )
-                            if success_dispatch:
-                                metrics["active_incident_id"] = inc_id
-
-                    metrics["cooldown_remaining"] = cooldown_left
+                    metrics["archive_active"] = True
+                    metrics["archive_source"] = src
                     metrics["source"] = src
                     metrics["camera_connected"] = True
 
                     ret, buffer = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     if ret:
                         jpeg_bytes = buffer.tobytes()
-                        with self.condition:
+                        with self.archive_lock:
+                            self.latest_archive_jpeg = jpeg_bytes
+                            self.latest_archive_annotated = annotated_frame.copy()
+                            self.latest_archive_raw = frame.copy()
+                            self.archive_frame_id += 1
+                        with self.archive_condition:
+                            self.archive_condition.notify_all()
+
+                        # Update primary metrics and legacy pointers
+                        with self.live_lock:
                             self.latest_jpeg = jpeg_bytes
                             self.latest_annotated_frame = annotated_frame.copy()
-                            self.latest_raw_frame = frame.copy()
+                            latest_annotated_frame = self.latest_annotated_frame
                             self.current_metrics = metrics
                             current_metrics = metrics
-                            latest_annotated_frame = self.latest_annotated_frame
                             self.frame_id += 1
-                            self.condition.notify_all()
 
                     elapsed = time.time() - t_start
-                    if not is_webcam:
-                        sleep_time = max(0.005, frame_delay - elapsed)
-                        time.sleep(sleep_time)
-                    else:
-                        if elapsed < 0.033:
-                            time.sleep(0.033 - elapsed)
+                    sleep_time = max(0.005, frame_delay - elapsed)
+                    time.sleep(sleep_time)
             finally:
                 if cap is not None:
                     try:
                         cap.release()
-                    except Exception as e:
-                        print(f"[CameraHub] Error releasing cap: {e}")
-                with self.lock:
-                    if self.active_cap is cap:
-                        self.active_cap = None
+                    except Exception:
+                        pass
+                with self.archive_lock:
+                    if self.archive_cap is cap:
+                        self.archive_cap = None
 
-    def generate_client_stream(self):
-        """Yields continuous MJPEG stream with boundary markers and Content-Length to any connected client."""
+    def generate_live_stream(self):
+        """Yields continuous MJPEG stream of live laptop webcam."""
         last_id = -1
         self.client_connected()
         try:
             while self._running:
                 try:
-                    with self.condition:
-                        while self.frame_id == last_id or self.latest_jpeg is None:
-                            if not self.condition.wait(timeout=0.4):
+                    with self.live_condition:
+                        while self.live_frame_id == last_id or self.latest_live_jpeg is None:
+                            if not self.live_condition.wait(timeout=0.3):
                                 break
-                        jpeg = self.latest_jpeg
-                        last_id = self.frame_id
+                        jpeg = self.latest_live_jpeg
+                        last_id = self.live_frame_id
 
                     if jpeg is not None:
                         self.heartbeat()
@@ -549,73 +646,119 @@ class CameraHub:
         finally:
             self.client_disconnected()
 
+    def generate_archive_stream(self):
+        """Yields continuous MJPEG stream of uploaded archive clip."""
+        last_id = -1
+        self.client_connected()
+        try:
+            while self._running:
+                try:
+                    with self.archive_condition:
+                        while self.archive_frame_id == last_id or self.latest_archive_jpeg is None:
+                            if not self.archive_condition.wait(timeout=0.3):
+                                break
+                        jpeg = self.latest_archive_jpeg
+                        last_id = self.archive_frame_id
+
+                    if jpeg is not None:
+                        self.heartbeat()
+                        header = (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n"
+                            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                        )
+                        yield (header + jpeg + b"\r\n")
+                    else:
+                        time.sleep(0.03)
+                except (GeneratorExit, ConnectionResetError, BrokenPipeError, OSError):
+                    break
+                except Exception:
+                    break
+        finally:
+            self.client_disconnected()
+
+    def generate_client_stream(self, stream="auto"):
+        """Yields MJPEG stream according to requested mode ('live', 'archive', or 'auto')."""
+        if stream == "live":
+            return self.generate_live_stream()
+        elif stream == "archive":
+            return self.generate_archive_stream()
+        else:
+            with self.archive_lock:
+                if self.archive_source is not None:
+                    return self.generate_archive_stream()
+            return self.generate_live_stream()
+
     def set_source(self, source):
-        """Thread-safely sets the active feed source."""
+        """Switches surveillance source. 'webcam' returns to single live view; any filename activates dual simultaneous mode."""
         global current_source
-        if source != "webcam":
+        if source == "webcam":
+            with self.archive_lock:
+                self.archive_source = None
+            with self.live_lock:
+                self.current_source = "webcam"
+                current_source = "webcam"
+                self.is_standby = False
+                self.last_client_activity = time.time()
+                self.analyzer.reset_state()
+                self.alert_manager.silence_alarm()
+            with self.live_condition:
+                self.live_condition.notify_all()
+            return True, "webcam"
+        else:
             video_path = self.upload_folder / source
             if not video_path.exists():
                 video_path = self.upload_folder / secure_filename(source)
             if not video_path.exists():
                 return False, f"Video '{source}' not found in archive."
             resolved_source = video_path.name
-        else:
-            resolved_source = "webcam"
-
-        with self.lock:
-            self.current_source = resolved_source
-            current_source = resolved_source
-            self._need_reconnect = True
-            # WAKE UP CAMERA IMMEDIATELY: Clear standby & reset idle timers
-            self.is_standby = False
-            self.last_client_activity = time.time()
-            if self.active_cap is not None:
-                try:
-                    self.active_cap.release()
-                except Exception:
-                    pass
-                self.active_cap = None
-            self.analyzer.reset_state()
-            self.alert_manager.silence_alarm()
-
-        with self.condition:
-            self.condition.notify_all()
-        return True, resolved_source
+            with self.archive_lock:
+                self.archive_source = resolved_source
+                if self._archive_thread is None or not self._archive_thread.is_alive():
+                    self._archive_thread = threading.Thread(target=self._archive_worker_loop, name="CameraHubArchiveWorker", daemon=True)
+                    self._archive_thread.start()
+            with self.live_lock:
+                self.current_source = resolved_source
+                current_source = resolved_source
+                self.is_standby = False
+                self.last_client_activity = time.time()
+                self.analyzer.reset_state()
+                self.alert_manager.silence_alarm()
+            with self.archive_condition:
+                self.archive_condition.notify_all()
+            return True, resolved_source
 
     def reconnect_camera(self):
-        """Forces the capture thread to re-open and probe camera hardware."""
-        global current_source
-        with self.lock:
-            self.current_source = "webcam"
-            current_source = "webcam"
-            self._need_reconnect = True
+        """Forces live camera capture thread to probe and reconnect."""
+        with self.live_lock:
+            self._need_live_reconnect = True
             self.is_standby = False
             self.last_client_activity = time.time()
-            if self.active_cap is not None:
+            if self.live_cap is not None:
                 try:
-                    self.active_cap.release()
+                    self.live_cap.release()
                 except Exception:
                     pass
-                self.active_cap = None
-            self.analyzer.reset_state()
-            self.alert_manager.silence_alarm()
-
-        with self.condition:
-            self.condition.notify_all()
+                self.live_cap = None
+        with self.live_condition:
+            self.live_condition.notify_all()
         return True
 
     def get_metrics(self):
-        with self.lock:
-            return self.current_metrics.copy()
+        with self.live_lock:
+            m = self.current_metrics.copy()
+        with self.archive_lock:
+            m["archive_active"] = (self.archive_source is not None)
+            m["archive_source"] = self.archive_source
+        return m
 
     def get_latest_annotated_frame(self):
-        with self.lock:
+        with self.live_lock:
             return self.latest_annotated_frame.copy() if self.latest_annotated_frame is not None else None
 
     def get_current_source(self):
-        with self.lock:
+        with self.live_lock:
             return self.current_source
-
 
 camera_hub = CameraHub(analyzer, alert_manager, UPLOAD_FOLDER)
 
@@ -807,8 +950,27 @@ header {
     align-items: stretch;
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 1200px) {
     .surveillance-stage {
+        grid-template-columns: 1fr;
+    }
+}
+
+.video-feeds-container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 100%;
+}
+
+.video-feeds-container.dual-mode {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+@media (max-width: 768px) {
+    .video-feeds-container.dual-mode {
         grid-template-columns: 1fr;
     }
 }
@@ -816,14 +978,42 @@ header {
 .video-wrapper {
     position: relative;
     width: 100%;
-    min-height: 380px;
+    min-height: 340px;
     background: #020408;
     border-radius: var(--radius-md);
     overflow: hidden;
     border: 2px solid var(--border);
     display: flex;
+    flex-direction: column;
+}
+
+.video-feed-header {
+    background: #08101d;
+    padding: 7px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+.video-feed-body {
+    position: relative;
+    flex: 1;
+    display: flex;
     align-items: center;
     justify-content: center;
+    background: #000;
+    min-height: 280px;
+}
+
+.video-feed-body img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
 }
 
 .gesture-telemetry-panel {
@@ -1547,13 +1737,43 @@ header {
                 <span id="currentSourceTag" style="font-size: 12px; color: var(--cyan); font-family: 'JetBrains Mono', monospace;">SOURCE: WEBCAM</span>
             </div>
 
-            <!-- SURVEILLANCE STAGE: Split layout placing live kinetics graph in the empty space beside the video -->
+            <!-- SURVEILLANCE STAGE: Split layout placing live kinetics graph beside video feeds -->
             <div class="surveillance-stage">
-                <div class="video-wrapper">
-                    <img id="videoFeed" class="video-feed" src="/video_feed" alt="Surveillance Stream">
-                    <div id="threatBanner" class="threat-banner">
-                        <span id="threatBannerText">🚨 CRITICAL ALERT: FIGHT DETECTED</span>
-                        <button class="btn btn-danger" style="padding: 4px 10px; font-size: 11px;" onclick="dispatchTestAlert()">DISPATCH TO AUTHORITY</button>
+                <!-- Video Feeds Container (Single or Dual Simultaneous Feeds) -->
+                <div class="video-feeds-container" id="videoFeedsContainer">
+                    <!-- CAM 01: Live Laptop Webcam (Always Running Simultaneously) -->
+                    <div class="video-wrapper" id="liveFeedWrapper">
+                        <div class="video-feed-header">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span class="live-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 8px #10b981;"></span>
+                                <span id="cam1Title" style="color: #34d399;">CAM 01: LIVE WEBCAM</span>
+                            </div>
+                            <span class="badge" id="cam1Badge" style="background: rgba(16, 185, 129, 0.15); color: #34d399; font-size: 10px; border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 4px; padding: 2px 6px;">● LIVE ACTIVE</span>
+                        </div>
+                        <div class="video-feed-body">
+                            <img id="liveFeedImg" class="video-feed" src="/video_feed/live" alt="Live Surveillance Stream">
+                        </div>
+                    </div>
+
+                    <!-- CAM 02: Uploaded CCTV Clip Analyzer (Simultaneous Side-by-Side Playback) -->
+                    <div class="video-wrapper" id="archiveFeedWrapper" style="display: none;">
+                        <div class="video-feed-header" style="background: #140d24; border-bottom: 1px solid #4c1d95;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span class="live-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #a855f7; box-shadow: 0 0 8px #a855f7;"></span>
+                                <span id="cam2Title" style="color: #c084fc;">CAM 02: UPLOADED CLIP ANALYSIS</span>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span class="badge" style="background: rgba(168, 85, 247, 0.15); color: #c084fc; font-size: 10px; border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 4px; padding: 2px 6px;">● AI ANALYZER</span>
+                                <button class="btn btn-secondary" onclick="setSource('webcam')" style="padding: 2px 8px; font-size: 10px; border-color: rgba(239, 68, 68, 0.5); color: #fca5a5; background: rgba(239, 68, 68, 0.1);" title="Close clip analysis and return to live webcam only">✕ Return to Live</button>
+                            </div>
+                        </div>
+                        <div class="video-feed-body">
+                            <img id="archiveFeedImg" class="video-feed" src="/video_feed/archive" alt="Uploaded Clip Analysis Stream">
+                            <div id="threatBanner" class="threat-banner">
+                                <span id="threatBannerText">🚨 CRITICAL ALERT: FIGHT DETECTED</span>
+                                <button class="btn btn-danger" style="padding: 4px 10px; font-size: 11px;" onclick="dispatchTestAlert()">DISPATCH TO AUTHORITY</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -2019,13 +2239,26 @@ let audioContext = null;
 let lastSirenTime = 0;
 let currentAuthority = {};
 
-const feedImg = document.getElementById('videoFeed');
-feedImg.onerror = function() {
-    console.warn("Stream connection interrupted. Reconnecting in 1s...");
-    setTimeout(() => {
-        feedImg.src = '/video_feed?t=' + Date.now();
-    }, 1000);
-};
+const liveFeedImg = document.getElementById('liveFeedImg');
+const archiveFeedImg = document.getElementById('archiveFeedImg');
+const feedImg = liveFeedImg || document.getElementById('videoFeed');
+
+if (liveFeedImg) {
+    liveFeedImg.onerror = function() {
+        console.warn("Live stream reconnecting...");
+        setTimeout(() => {
+            liveFeedImg.src = '/video_feed/live?t=' + Date.now();
+        }, 1200);
+    };
+}
+if (archiveFeedImg) {
+    archiveFeedImg.onerror = function() {
+        console.warn("Archive stream reconnecting...");
+        setTimeout(() => {
+            archiveFeedImg.src = '/video_feed/archive?t=' + Date.now();
+        }, 1200);
+    };
+}
 
 function updateClock() {
     const now = new Date();
@@ -2168,12 +2401,22 @@ async function setSource(sourceName) {
             const cleanId = 'src-' + sourceName.replace(/[^a-zA-Z0-9]/g, '');
             const activeBtn = document.getElementById(cleanId);
             if (activeBtn) activeBtn.classList.add('active');
-            document.getElementById('currentSourceTag').textContent = 'SOURCE: ' + sourceName.toUpperCase();
 
-            // Instantly reconnect stream with timestamp to load new feed immediately
-            setTimeout(() => {
-                feedImg.src = '/video_feed?t=' + Date.now();
-            }, 100);
+            const feedsContainer = document.getElementById('videoFeedsContainer');
+            const archiveWrapper = document.getElementById('archiveFeedWrapper');
+            const cam2Title = document.getElementById('cam2Title');
+
+            if (sourceName !== 'webcam') {
+                if (archiveFeedImg) archiveFeedImg.src = '/video_feed/archive?t=' + Date.now();
+                if (archiveWrapper) archiveWrapper.style.display = 'flex';
+                if (feedsContainer) feedsContainer.classList.add('dual-mode');
+                if (cam2Title) cam2Title.textContent = 'CAM 02: ' + sourceName.toUpperCase();
+                document.getElementById('currentSourceTag').textContent = 'SOURCE: DUAL (LIVE + ' + sourceName.toUpperCase() + ')';
+            } else {
+                if (archiveWrapper) archiveWrapper.style.display = 'none';
+                if (feedsContainer) feedsContainer.classList.remove('dual-mode');
+                document.getElementById('currentSourceTag').textContent = 'SOURCE: LIVE WEBCAM';
+            }
         }
     } catch (e) {
         console.error("Error setting source:", e);
@@ -2546,11 +2789,28 @@ async function refreshTelemetry() {
             });
         }
 
+        // Synchronize Dual Simultaneous Feeds State
+        const isArchiveActive = !!data.archive_active;
+        const feedsContainer = document.getElementById('videoFeedsContainer');
+        const archiveWrapper = document.getElementById('archiveFeedWrapper');
+        const cam2Title = document.getElementById('cam2Title');
+
+        if (isArchiveActive) {
+            if (feedsContainer) feedsContainer.classList.add('dual-mode');
+            if (archiveWrapper) archiveWrapper.style.display = 'flex';
+            if (cam2Title) cam2Title.textContent = 'CAM 02: ' + (data.archive_source || 'CLIP ANALYSIS');
+            document.getElementById('currentSourceTag').textContent = 'SOURCE: DUAL (LIVE + ' + (data.archive_source || 'CLIP') + ')';
+        } else {
+            if (feedsContainer) feedsContainer.classList.remove('dual-mode');
+            if (archiveWrapper) archiveWrapper.style.display = 'none';
+            document.getElementById('currentSourceTag').textContent = 'SOURCE: LIVE WEBCAM';
+        }
+
         // Update Real-time Gesture & Demeanor Movement Telemetry
         const kTel = data.kinetic_telemetry || {};
         const cat = kTel.gesture_category || "CALM";
         currentGestureCategory = cat;
-        targetAnimSpeed = kTel.strike_speed || 0.15;
+        targetAnimSpeed = kTel.strike_speed || 0.18;
 
         const gtGesture = document.getElementById('gtGestureType');
         const gtDemeanor = document.getElementById('gtFacialDemeanor');
@@ -2864,21 +3124,45 @@ async function sendTestTelegramAlert() {
 // ---------------- REAL-TIME BODY KINETICS OSCILLOSCOPE ----------------
 const kineticCanvas = document.getElementById('gestureWaveformCanvas');
 const kCtx = kineticCanvas ? kineticCanvas.getContext('2d') : null;
-const kineticPoints = new Array(80).fill(0.2);
-let currentAnimSpeed = 0.2;
-let targetAnimSpeed = 0.2;
+const kineticPoints = new Array(80).fill(0.18);
+let smoothedAnimSpeed = 0.18;
+let targetAnimSpeed = 0.18;
 let currentGestureCategory = "CALM";
+let lastPointPushTime = performance.now();
+let wavePhase = 0;
 
 function updateWaveformCanvas() {
     if (!kCtx || !kineticCanvas) return;
     
-    // Smooth interpolation towards latest target speed with biological micro-tremor
-    currentAnimSpeed += (targetAnimSpeed - currentAnimSpeed) * 0.18;
-    const tremor = (Math.random() - 0.5) * 0.04;
-    const valWithTremor = Math.max(0.05, currentAnimSpeed + tremor);
+    wavePhase += 0.05;
     
-    kineticPoints.shift();
-    kineticPoints.push(valWithTremor);
+    // Compute stabilized target speed according to verified gesture category:
+    let effectiveTarget = 0.18;
+    if (currentGestureCategory === 'CALM') {
+        // Serene, calm, stable vital baseline: NO jumping up and down without violence!
+        // Anchors strictly within 0.12 - 0.22 m/s with a gentle harmonic respiration wave
+        const gentleWave = Math.sin(wavePhase * 1.8) * 0.035;
+        effectiveTarget = Math.max(0.12, Math.min(0.24, (targetAnimSpeed * 0.12) + 0.14)) + gentleWave;
+    } else if (currentGestureCategory === 'PLAYFUL_GESTURE') {
+        // Playful / Casual gestures: elevate into amber band (1.6 - 2.5 m/s) smoothly
+        const playfulWave = Math.sin(wavePhase * 2.5) * 0.15;
+        effectiveTarget = Math.max(1.65, Math.min(2.55, targetAnimSpeed)) + playfulWave;
+    } else {
+        // Serious Combat: surge into crimson red band (2.8 - 4.0 m/s)
+        const combatWave = Math.sin(wavePhase * 3.5) * 0.25;
+        effectiveTarget = Math.max(2.85, Math.min(3.85, targetAnimSpeed)) + combatWave;
+    }
+    
+    // Heavy Exponential Moving Average (EMA) smoothing to eliminate any frame-to-frame spikes
+    smoothedAnimSpeed += (effectiveTarget - smoothedAnimSpeed) * 0.12;
+    
+    // Sample points at 11 Hz (every ~90ms), giving an 80-point rolling window of ~7.2 seconds!
+    const now = performance.now();
+    if (now - lastPointPushTime >= 90) {
+        lastPointPushTime = now;
+        kineticPoints.shift();
+        kineticPoints.push(smoothedAnimSpeed);
+    }
     
     const w = kineticCanvas.width;
     const h = kineticCanvas.height;
@@ -2933,49 +3217,63 @@ function updateWaveformCanvas() {
     kCtx.fillStyle = '#10b981';
     kCtx.fillText('0.0-1.6 CALM CONVERSATION', 8, h - 6);
     
-    // Draw Waveform curve
-    kCtx.beginPath();
+    // Determine dynamic zone colors
+    let strokeColor = '#10b981';
+    let fillColor = 'rgba(16, 185, 129, 0.12)';
+    let glowColor = 'rgba(16, 185, 129, 0.6)';
+    if (currentGestureCategory === 'SERIOUS_COMBAT') {
+        strokeColor = '#ef4444';
+        fillColor = 'rgba(239, 68, 68, 0.20)';
+        glowColor = 'rgba(239, 68, 68, 0.85)';
+    } else if (currentGestureCategory === 'PLAYFUL_GESTURE') {
+        strokeColor = '#f59e0b';
+        fillColor = 'rgba(245, 158, 11, 0.16)';
+        glowColor = 'rgba(245, 158, 11, 0.7)';
+    }
+    
+    // Build path for waveform and filled area
     const step = w / (kineticPoints.length - 1);
+    kCtx.beginPath();
     for (let i = 0; i < kineticPoints.length; i++) {
         const x = i * step;
-        const clampedVal = Math.min(maxScale, kineticPoints[i]);
+        const clampedVal = Math.max(0.05, Math.min(maxScale, kineticPoints[i]));
         const y = h - (clampedVal / maxScale) * h;
         if (i === 0) {
             kCtx.moveTo(x, y);
         } else {
             const prevX = (i - 1) * step;
-            const prevVal = Math.min(maxScale, kineticPoints[i - 1]);
+            const prevVal = Math.max(0.05, Math.min(maxScale, kineticPoints[i - 1]));
             const prevY = h - (prevVal / maxScale) * h;
             const midX = (prevX + x) / 2;
             kCtx.quadraticCurveTo(prevX, prevY, midX, (prevY + y) / 2);
         }
     }
     
-    // Dynamic waveform stroke color based on current state
-    let strokeColor = '#10b981';
-    let glowColor = 'rgba(16, 185, 129, 0.6)';
-    if (currentGestureCategory === 'SERIOUS_COMBAT') {
-        strokeColor = '#ef4444';
-        glowColor = 'rgba(239, 68, 68, 0.8)';
-    } else if (currentGestureCategory === 'PLAYFUL_GESTURE') {
-        strokeColor = '#f59e0b';
-        glowColor = 'rgba(245, 158, 11, 0.7)';
-    }
-    
+    // Stroke the waveform
     kCtx.strokeStyle = strokeColor;
-    kCtx.lineWidth = 2.5;
+    kCtx.lineWidth = 2.4;
     kCtx.shadowColor = glowColor;
     kCtx.shadowBlur = 8;
     kCtx.stroke();
     kCtx.shadowBlur = 0;
     
-    // Draw pulse dot at head of curve
-    const lastClamped = Math.min(maxScale, kineticPoints[kineticPoints.length - 1]);
+    // Draw subtle gradient fill under the line
+    kCtx.lineTo(w, h);
+    kCtx.lineTo(0, h);
+    kCtx.closePath();
+    kCtx.fillStyle = fillColor;
+    kCtx.fill();
+    
+    // Draw leading pulse dot at head of curve
+    const lastClamped = Math.max(0.05, Math.min(maxScale, kineticPoints[kineticPoints.length - 1]));
     const headY = h - (lastClamped / maxScale) * h;
     kCtx.fillStyle = strokeColor;
+    kCtx.shadowColor = strokeColor;
+    kCtx.shadowBlur = 10;
     kCtx.beginPath();
-    kCtx.arc(w - 2, headY, 4, 0, Math.PI * 2);
+    kCtx.arc(w - 2, headY, currentGestureCategory === 'SERIOUS_COMBAT' ? 5 : 3.5, 0, Math.PI * 2);
     kCtx.fill();
+    kCtx.shadowBlur = 0;
     
     requestAnimationFrame(updateWaveformCanvas);
 }
@@ -3006,8 +3304,27 @@ def home():
 @app.route("/video_feed")
 def video_feed():
     camera_hub.heartbeat()
+    stream_type = request.args.get("stream", "auto")
     return Response(
-        camera_hub.generate_client_stream(),
+        camera_hub.generate_client_stream(stream=stream_type),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/video_feed/live")
+def video_feed_live():
+    camera_hub.heartbeat()
+    return Response(
+        camera_hub.generate_live_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/video_feed/archive")
+def video_feed_archive():
+    camera_hub.heartbeat()
+    return Response(
+        camera_hub.generate_archive_stream(),
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
 
